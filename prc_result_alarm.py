@@ -615,8 +615,8 @@ class WatcherApp:
             self.log("Replaying the announcement alarm. Click Silence alarm to stop.")
         else:
             self.play()
-            self.sound_test_job = self.root.after(5000, self.silence)
-            self.log("Sound test · stops after 5 seconds.")
+            self.sound_test_job = self.root.after(30000, self.silence)
+            self.log("Sound test · stops after 30 seconds.")
 
     def show_match(self, match):
         self.match = match

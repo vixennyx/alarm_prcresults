@@ -8,7 +8,7 @@ A little Windows app that checks PRC for pharmacy exam results and rings when it
 2. Install [Python 3.10 or newer](https://www.python.org/downloads/windows/) if you don't have it. Keep Tcl/Tk enabled.
 3. Open `START_ALARM.cmd`.
 4. Pick your exam month and year. It starts on October 2026, so change that if needed.
-5. Click **Test alarm**, then **Start watching**.
+5. Click **Test alarm** for a 30-second preview, then **Start watching**.
 
 Keep the app and its console open, your PC awake, and your internet and sound on. Checks run about every two minutes; errors make retries slower.
 
