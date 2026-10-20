@@ -21,7 +21,3 @@ When results show up, click **Silence alarm** to stop the sound or **View result
 3. Restart the app and click **Test alarm**.
 
 Remove or rename `alarm.wav` to bring back the default sound. Your custom file stays untouched.
-
-This is an unofficial announcement watcher. It doesn't check whether you passed, and a quiet alarm doesn't guarantee results aren't out. Use **Open PRC** to check yourself.
-
-More details: [READ_ME_FIRST.txt](READ_ME_FIRST.txt).
