@@ -23,8 +23,8 @@ class PageTests(unittest.TestCase):
 
         match = alarm.inspect_page(page, BASE, alarm.Target())
 
-        self.assertIsNotNone(match)
-        self.assertEqual(match.url, RESULT_URL)
+        self.assertEqual(len(match), 1)
+        self.assertEqual(match[0].url, RESULT_URL)
 
     def test_result_slug_can_supply_the_title_for_an_image_link(self):
         page = (
@@ -35,9 +35,9 @@ class PageTests(unittest.TestCase):
 
         match = alarm.inspect_page(page, BASE, alarm.Target())
 
-        self.assertIsNotNone(match)
+        self.assertEqual(len(match), 1)
         self.assertEqual(
-            match.title, "october 2026 pharmacists licensure examination results"
+            match[0].title, "october 2026 pharmacists licensure examination results"
         )
 
     def test_unrelated_fields_are_not_combined_into_a_match(self):
@@ -47,7 +47,7 @@ class PageTests(unittest.TestCase):
             "October 2026</a>"
         )
 
-        self.assertIsNone(alarm.inspect_page(page, BASE, alarm.Target()))
+        self.assertEqual(alarm.inspect_page(page, BASE, alarm.Target()), [])
 
     def test_expected_release_notice_is_not_a_result(self):
         page = (
@@ -56,7 +56,7 @@ class PageTests(unittest.TestCase):
             f"{RESULT_TITLE}</a>"
         )
 
-        self.assertIsNone(alarm.inspect_page(page, BASE, alarm.Target()))
+        self.assertEqual(alarm.inspect_page(page, BASE, alarm.Target()), [])
 
     def test_script_and_template_content_do_not_trigger_results(self):
         page = (
@@ -65,7 +65,7 @@ class PageTests(unittest.TestCase):
             f"<script>{RESULT_PAGE}</script><template>{RESULT_PAGE}</template>"
         )
 
-        self.assertIsNone(alarm.inspect_page(page, BASE, alarm.Target()))
+        self.assertEqual(alarm.inspect_page(page, BASE, alarm.Target()), [])
 
     def test_unverified_page_reports_an_error_instead_of_no_result(self):
         with self.assertRaises(alarm.CheckError):
@@ -133,14 +133,16 @@ class MonitorTests(unittest.TestCase):
                 raise alarm.CheckError("Connection unavailable")
             return RESULT_PAGE
 
-        alarm.monitor(alarm.Target(), threading.Event(), events, fetch=fetch)
+        stop = threading.Event()
+        stop.wait = lambda timeout: stop.set()
+        alarm.monitor([alarm.Watch()], stop, events, fetch=fetch)
 
         received = list(events.queue)
         self.assertEqual(
             [(event, index) for event, index, _ in received],
-            [("checking", 0), ("error", 0), ("checking", 1), ("found", 1), ("done", -1)],
+            [("checking", 0), ("error", 0), ("checking", 1), ("found", 1), ("ok", 1), ("done", -1)],
         )
-        self.assertEqual(received[3][2].url, RESULT_URL)
+        self.assertEqual(received[3][2].article.url, RESULT_URL)
 
     def test_stopping_during_request_does_not_emit_late_result(self):
         events = queue.Queue()
@@ -150,12 +152,81 @@ class MonitorTests(unittest.TestCase):
             stop.set()
             return RESULT_PAGE
 
-        alarm.monitor(alarm.Target(), stop, events, fetch=fetch)
+        alarm.monitor([alarm.Watch()], stop, events, fetch=fetch)
 
         self.assertEqual(
             [(event, index) for event, index, _ in list(events.queue)],
             [("checking", 0), ("done", -1)],
         )
+
+    def test_multiple_results_and_overlapping_watches_alert_once_each(self):
+        nurses = alarm.Watch(alarm.Target("October", "2026", "Nurses"), "nurses.wav")
+        all_boards = alarm.Watch(alarm.Target("", "", alarm.ALL_EXAMS), "all.wav")
+        watches = [all_boards, alarm.Watch(), nurses]
+        page = RESULT_PAGE + (
+            '<a href="/article/nurses">October 2026 Nurses Licensure Examination Results</a>')
+        stop = threading.Event()
+        stop.wait = lambda timeout: stop.set()
+        events = queue.Queue()
+        calls = []
+        def fetch(url):
+            calls.append(url)
+            return page
+        alarm.monitor(watches, stop, events, fetch=fetch)
+        found = [payload for event, _, payload in events.queue if event == "found"]
+        self.assertEqual(len(found), 2)
+        self.assertEqual(found[0].watches[0].target.exam, "Pharmacists")
+        self.assertEqual(found[1].watches[0], nurses)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(found[1].watches[1], all_boards)
+
+    def test_new_only_baselines_each_source_and_alerts_on_later_additions(self):
+        stop = threading.Event()
+        rounds = 0
+        events = queue.Queue()
+        def wait(timeout):
+            nonlocal rounds
+            rounds += 1
+            if rounds == 3:
+                stop.set()
+        stop.wait = wait
+        new_link = '<a href="/article/nurses">October 2026 Nurses Licensure Examination Results</a>'
+        def fetch(url):
+            return RESULT_PAGE + (new_link if rounds else "")
+        with patch.object(alarm, "INTERVAL", 0):
+            alarm.monitor([alarm.Watch(alarm.Target("", "", alarm.ALL_EXAMS), new_only=True)],
+                          stop, events, fetch=fetch)
+        found = [payload for event, _, payload in events.queue if event == "found"]
+        self.assertEqual(len(found), 1)
+        self.assertIn("Nurses", found[0].article.title)
+
+    def test_new_only_does_not_treat_error_page_as_baseline(self):
+        stop = threading.Event()
+        rounds = 0
+        events = queue.Queue()
+        def wait(timeout):
+            nonlocal rounds
+            rounds += 1
+            if rounds == 3:
+                stop.set()
+        stop.wait = wait
+        def fetch(url):
+            if rounds == 0:
+                raise alarm.CheckError("Offline")
+            return RESULT_PAGE
+        with patch.object(alarm, "INTERVAL", 0):
+            alarm.monitor([alarm.Watch(alarm.Target("", "", alarm.ALL_EXAMS), new_only=True)],
+                          stop, events, fetch=fetch)
+        self.assertFalse(any(event == "found" for event, _, _ in events.queue))
+
+    def test_node_alias_and_article_slug_with_same_title_are_deduplicated(self):
+        stop = threading.Event()
+        stop.wait = lambda timeout: stop.set()
+        events = queue.Queue()
+        def fetch(url):
+            return RESULT_PAGE if "articles" in url else RESULT_PAGE.replace(RESULT_URL, "/node/123")
+        alarm.monitor([alarm.Watch()], stop, events, fetch=fetch)
+        self.assertEqual(sum(event == "found" for event, _, _ in events.queue), 1)
 
 
 if __name__ == "__main__":

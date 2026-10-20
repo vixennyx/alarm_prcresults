@@ -4,4 +4,7 @@ __pycache__/
 .env
 .env.*
 !.env.example
-alarm.wav
+*.wav
+watchlist.json
+.watchlist-*.tmp
+.watchlist-recovery-*.json
