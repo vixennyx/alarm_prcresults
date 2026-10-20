@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
+from app_files import data_directory, import_sound, migrate_settings, validate_sound
 from watches import ALL_EXAMS, EXAMS, EXCLUDED_NOTICE, Target, Watch, load_watches, normalize, save_watches
 
 SOURCES = (
@@ -296,14 +297,6 @@ def create_alarm(path: Path):
         output.writeframes(samples)
 
 
-def validate_sound(path: Path):
-    if path.suffix.lower() != ".wav":
-        raise ValueError("Choose a PCM WAV file.")
-    with wave.open(str(path), "rb") as sound:
-        if sound.getcomptype() != "NONE" or sound.getnframes() == 0 or not sound.readframes(1):
-            raise ValueError("Choose a WAV file with playable PCM audio.")
-
-
 class WatcherApp:
     def __init__(self, root, settings_path: Path | None = None):
         import tkinter as tk
@@ -319,9 +312,12 @@ class WatcherApp:
         self.pending_alerts = deque()
         self.results = []
         self.found_counts = {}
-        self.settings_path = settings_path or Path(__file__).with_name("watchlist.json")
+        self.settings_path = settings_path or data_directory() / "watchlist.json"
         settings_error = ""
         try:
+            if settings_path is None:
+                legacy = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
+                migrate_settings(legacy, self.settings_path.parent)
             self.watches = load_watches(self.settings_path)
         except (OSError, ValueError) as exc:
             self.watches = [Watch()]
@@ -334,7 +330,7 @@ class WatcherApp:
         self.source_state = ["idle", "idle"]
         self.next_checks = [0.0, 0.0]
         self.tempdir = tempfile.TemporaryDirectory(prefix="prc_alarm_")
-        self.sound_file = Path(__file__).with_name("alarm.wav")
+        self.sound_file = self.settings_path.parent / "alarm.wav"
         if not self.sound_file.is_file():
             self.sound_file = Path(self.tempdir.name) / "alarm.wav"
             create_alarm(self.sound_file)
@@ -564,6 +560,14 @@ class WatcherApp:
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
 
+    def notify(self, title, message, kind="info"):
+        from tkinter import messagebox
+        self.detail.set(message.splitlines()[0])
+        self.log(message)
+        show = {"info": messagebox.showinfo, "warning": messagebox.showwarning,
+                "error": messagebox.showerror}[kind]
+        show(title, message, parent=self.root)
+
     def exam_changed(self, event=None):
         is_all = self.exam.get() == ALL_EXAMS
         self.new_only.set(is_all)
@@ -619,8 +623,9 @@ class WatcherApp:
                 self.settings_load_failed = False
             save_watches(self.settings_path, watches)
         except OSError as exc:
-            self.detail.set("Couldn't save your watches. Check Activity and try again.")
             self.log(f"Couldn't save watch list: {exc}")
+            self.notify("Couldn't save", "Your changes weren't saved. Check that your app data folder "
+                        "is writable and has free space, then try again.", "error")
             return False
         self.watches = watches
         self.refresh_watches(selection)
@@ -640,16 +645,25 @@ class WatcherApp:
             if len(self.watches) >= 100:
                 raise ValueError("Your list is full. Remove a watch before adding another.")
         except ValueError as exc:
-            self.detail.set(str(exc))
+            self.notify("Check your watch", str(exc), "warning")
             return
-        self.store_watches([*self.watches, Watch(target, new_only=self.new_only.get())],
-                           selection=len(self.watches))
+        if self.store_watches([*self.watches, Watch(target, new_only=self.new_only.get())],
+                              selection=len(self.watches)):
+            self.notify("Watch added", f"{target.exam} · {target.period}\n\n"
+                        "Saved to your list. Click Start watching when you're ready.")
 
     def remove_watch(self):
+        from tkinter import messagebox
         index = self.selected_watch_index()
         if self.running or index is None:
             return
-        self.store_watches(self.watches[:index] + self.watches[index + 1:], selection=max(0, index - 1))
+        target = self.watches[index].target
+        if not messagebox.askyesno("Remove watch?",
+                                   f"Remove {target.exam} · {target.period} from your list?",
+                                   parent=self.root, default="no"):
+            return
+        if self.store_watches(self.watches[:index] + self.watches[index + 1:], selection=max(0, index - 1)):
+            self.notify("Watch removed", f"{target.exam} was removed from your watch list.")
 
     def choose_sound(self):
         from tkinter import filedialog
@@ -661,14 +675,17 @@ class WatcherApp:
         if not filename:
             return
         try:
-            validate_sound(Path(filename))
+            sound = import_sound(Path(filename), self.settings_path.parent)
         except (OSError, ValueError, wave.Error, EOFError) as exc:
-            self.detail.set("Couldn't use that sound. Choose a PCM WAV file.")
             self.log(f"Couldn't read sound: {exc}")
+            self.notify("Couldn't save sound", "Choose a readable PCM WAV file and make sure "
+                        "there's space to save it. Your previous sound is unchanged.", "error")
             return
         watches = self.watches.copy()
-        watches[index] = replace(watches[index], sound=filename)
-        self.store_watches(watches, selection=index)
+        watches[index] = replace(watches[index], sound=sound)
+        if self.store_watches(watches, selection=index):
+            self.notify("Sound saved", f"{Path(filename).name}\nFor {watches[index].target.exam}\n\n"
+                        "A copy is saved in the app. Click Test (30s) to hear it.")
 
     def use_default_sound(self):
         index = self.selected_watch_index()
@@ -676,7 +693,8 @@ class WatcherApp:
             return
         watches = self.watches.copy()
         watches[index] = replace(watches[index], sound="")
-        self.store_watches(watches, selection=index)
+        if self.store_watches(watches, selection=index):
+            self.notify("Default sound restored", f"{watches[index].target.exam} will use the default alarm.")
 
     def start(self):
         if self.running or not self.watches:

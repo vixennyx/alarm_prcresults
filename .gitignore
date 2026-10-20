@@ -1,6 +1,12 @@
 __pycache__/
 *.py[cod]
 .venv/
+.venv-build/
+build/
+dist/
+*.spec
+docs/superpowers/
+.superpowers/
 .env
 .env.*
 !.env.example

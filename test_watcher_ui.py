@@ -17,6 +17,11 @@ class WatcherUITests(unittest.TestCase):
         self.root.withdraw()
         self.preferences = tempfile.TemporaryDirectory()
         self.addCleanup(self.preferences.cleanup)
+        self.dialogs = {}
+        for name in ("showinfo", "showwarning", "showerror", "askyesno"):
+            dialog = patch(f"tkinter.messagebox.{name}", return_value=True)
+            self.dialogs[name] = dialog.start()
+            self.addCleanup(dialog.stop)
         self.app = WatcherApp(self.root, settings_path=Path(self.preferences.name) / "watchlist.json")
         self.root.update_idletasks()
         self.root.after_cancel(self.app.pump_job)
@@ -194,7 +199,10 @@ class WatcherUITests(unittest.TestCase):
             self.app.choose_sound()
         saved = prc_result_alarm.load_watches(self.app.settings_path)
         self.assertEqual(saved[0].sound, "")
-        self.assertEqual(saved[1].sound, str(sound))
+        imported = self.app.settings_path.parent / saved[1].sound
+        self.assertNotEqual(imported, sound)
+        self.assertEqual(imported.read_bytes(), sound.read_bytes())
+        self.assertEqual(imported.name, sound.name)
         self.app.use_default_sound()
         self.assertEqual(prc_result_alarm.load_watches(self.app.settings_path)[1].sound, "")
 
@@ -212,18 +220,47 @@ class WatcherUITests(unittest.TestCase):
             self.app.start()
         worker.assert_not_called()
 
+    def test_add_and_duplicate_watch_have_visible_feedback(self):
+        self.app.exam.set("Nurses")
+        self.app.add_watch()
+        self.dialogs["showinfo"].assert_called_once()
+        self.assertIn("Nurses", self.dialogs["showinfo"].call_args.args[1])
+        self.app.add_watch()
+        self.dialogs["showwarning"].assert_called_once()
+        self.assertEqual(len(self.app.watches), 2)
+
+    def test_removing_watch_can_be_cancelled(self):
+        self.dialogs["askyesno"].return_value = False
+        self.app.remove_watch()
+        self.assertEqual(self.app.watches, [Watch()])
+        self.dialogs["askyesno"].return_value = True
+        self.app.remove_watch()
+        self.assertEqual(self.app.watches, [])
+
+    def test_failed_save_shows_error_and_no_success_dialog(self):
+        self.app.exam.set("Nurses")
+        with patch("prc_result_alarm.save_watches", side_effect=OSError("Disk full")):
+            self.app.add_watch()
+        self.dialogs["showerror"].assert_called_once()
+        self.dialogs["showinfo"].assert_not_called()
+
 
 class AlarmFileTests(unittest.TestCase):
+    def setUp(self):
+        self.preferences = tempfile.TemporaryDirectory()
+        self.addCleanup(self.preferences.cleanup)
+        self.settings_path = Path(self.preferences.name) / "watchlist.json"
+
     def test_custom_alarm_is_used_without_overwriting_it(self):
         root = tk.Tk()
         root.withdraw()
         try:
             with patch.object(Path, "is_file", return_value=True), \
                     patch("prc_result_alarm.create_alarm") as generate:
-                app = WatcherApp(root)
+                app = WatcherApp(root, settings_path=self.settings_path)
             self.addCleanup(app.tempdir.cleanup)
             root.after_cancel(app.pump_job)
-            self.assertEqual(app.sound_file, Path(prc_result_alarm.__file__).with_name("alarm.wav"))
+            self.assertEqual(app.sound_file, self.settings_path.parent / "alarm.wav")
             generate.assert_not_called()
         finally:
             root.destroy()
@@ -233,7 +270,7 @@ class AlarmFileTests(unittest.TestCase):
         root.withdraw()
         try:
             with patch.object(Path, "is_file", return_value=False):
-                app = WatcherApp(root)
+                app = WatcherApp(root, settings_path=self.settings_path)
             self.addCleanup(app.tempdir.cleanup)
             root.after_cancel(app.pump_job)
             self.assertEqual(app.sound_file.parent, Path(app.tempdir.name))
