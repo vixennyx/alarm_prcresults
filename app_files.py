@@ -1,6 +1,7 @@
 """Persistent settings and audio for the script and Windows executable."""
 
 import hashlib
+import json
 import os
 import shutil
 import tempfile
@@ -44,6 +45,45 @@ def import_sound(source: Path, directory: Path) -> str:
         destination.parent.mkdir(exist_ok=True)
         os.replace(temporary, destination)
         return str(destination.relative_to(directory))
+    finally:
+        if temporary and temporary.exists():
+            temporary.unlink()
+
+
+def available_sounds(directory: Path) -> list[str]:
+    """Return managed PCM WAV sounds, including files imported by older releases."""
+    sounds = directory / "sounds"
+    paths = []
+    for path in sounds.glob("*/*.wav"):
+        try:
+            validate_sound(path)
+        except (OSError, ValueError, wave.Error, EOFError):
+            continue
+        paths.append(str(path.relative_to(directory)))
+    return sorted(paths, key=lambda name: Path(name).name.casefold())
+
+
+def load_preferences(directory: Path) -> dict:
+    path = directory / "preferences.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and data.get("version") == 1:
+            return {"auto_open": data.get("auto_open") is True}
+    except (OSError, ValueError):
+        pass
+    return {"auto_open": False}
+
+
+def save_preferences(directory: Path, auto_open: bool):
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "preferences.json"
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory,
+                                         prefix=".preferences-", suffix=".tmp", delete=False) as output:
+            temporary = Path(output.name)
+            json.dump({"version": 1, "auto_open": auto_open}, output)
+        os.replace(temporary, path)
     finally:
         if temporary and temporary.exists():
             temporary.unlink()

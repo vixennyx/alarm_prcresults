@@ -228,6 +228,34 @@ class MonitorTests(unittest.TestCase):
         alarm.monitor([alarm.Watch()], stop, events, fetch=fetch)
         self.assertEqual(sum(event == "found" for event, _, _ in events.queue), 1)
 
+    def test_watch_added_while_running_uses_its_own_new_only_baseline(self):
+        stop = threading.Event()
+        events = queue.Queue()
+        watches = [alarm.Watch()]
+        rounds = 0
+        nurses_link = ('<a href="/article/nurses">October 2026 Nurses '
+                       'Licensure Examination Results</a>')
+
+        def wait(timeout):
+            nonlocal rounds
+            rounds += 1
+            if rounds == 1:
+                watches.append(alarm.Watch(alarm.Target("October", "2026", "Nurses"),
+                                           new_only=True))
+            if rounds == 3:
+                stop.set()
+
+        stop.wait = wait
+
+        def fetch(url):
+            return RESULT_PAGE + (nurses_link if rounds else "")
+
+        with patch.object(alarm, "INTERVAL", 0):
+            alarm.monitor(watches.copy(), stop, events, fetch=fetch,
+                          get_watches=lambda: watches.copy())
+        found = [payload for event, _, payload in events.queue if event == "found"]
+        self.assertEqual(sum("Nurses" in item.article.title for item in found), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

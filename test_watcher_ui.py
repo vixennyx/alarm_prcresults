@@ -35,32 +35,30 @@ class WatcherUITests(unittest.TestCase):
     def tearDown(self):
         self.app.close()
 
-    def test_main_button_stops_then_restores_after_worker_finishes(self):
+    def test_main_button_pauses_and_resumes_without_restarting_worker(self):
         with patch("prc_result_alarm.threading.Thread") as thread:
             thread.return_value.is_alive.return_value = True
             self.app.start_button.invoke()
-        self.assertEqual(self.app.start_button.cget("text"), "Stop watching")
-        self.assertEqual(str(self.app.month_box.cget("state")), "disabled")
+        self.assertEqual(self.app.start_button.cget("text"), "Ⅱ  Pause")
         self.app.start_button.invoke()
-        self.assertTrue(self.app.stop.is_set())
-        self.assertIn("disabled", self.app.start_button.state())
-        self.app.worker.is_alive.return_value = False
-        self.app.events.put(("done", -1, None))
-        self.app.pump()
-        self.assertEqual(self.app.start_button.cget("text"), "Start watching")
-        self.assertNotIn("disabled", self.app.start_button.state())
-        self.assertEqual(str(self.app.month_box.cget("state")), "readonly")
+        self.assertTrue(self.app.paused.is_set())
+        self.assertEqual(self.app.start_button.cget("text"), "▶  Resume")
+        self.app.start_button.invoke()
+        self.assertFalse(self.app.paused.is_set())
+        self.assertEqual(self.app.start_button.cget("text"), "Ⅱ  Pause")
+        thread.assert_called_once()
 
     def test_errors_never_claim_results_are_absent(self):
+        self.app.running = True
         self.app.worker = Mock()
         self.app.worker.is_alive.return_value = True
         self.app.events.put(("error", 0, ("Offline", 0)))
         self.app.events.put(("error", 1, ("Offline", 0)))
         self.app.pump()
-        self.assertIn("unknown", self.app.detail.get().lower())
+        self.assertEqual(self.app.status.get(), "Reconnecting")
         self.assertEqual(self.app.source_state, ["error", "error"])
 
-    def test_found_result_survives_done_and_test_alarm_replays_it(self):
+    def test_found_result_survives_done_and_keeps_its_link(self):
         match = Article("October 2026 Pharmacists Licensure Examination Results", "https://prc.gov.ph/node/1")
         self.app.auto_open.set(False)
         self.app.play = Mock()
@@ -70,11 +68,12 @@ class WatcherUITests(unittest.TestCase):
                 patch.object(self.root, "attributes"):
             self.app.pump()
         self.assertEqual(self.app.match, match)
-        self.assertIn("found", self.app.status.get().lower())
-        self.assertEqual(self.app.detail.get(), match.title)
+        self.assertEqual(self.app.status.get(), "Results released")
+        self.assertEqual(self.app.watch_name.get(), "Pharmacists")
+        self.assertEqual(self.app.detail.get(), "prc.gov.ph")
         self.app.test_alarm()
         self.assertIsNone(self.app.sound_test_job)
-        self.assertEqual(self.app.play.call_count, 2)
+        self.assertEqual(self.app.play.call_count, 1)
 
     def test_sound_test_timer_cannot_silence_a_real_alert(self):
         self.app.test_alarm()
@@ -90,30 +89,80 @@ class WatcherUITests(unittest.TestCase):
         self.app.silence_button.invoke()
         self.assertFalse(self.app.alarm_active)
         self.assertIn("disabled", self.app.silence_button.state())
+        self.assertEqual(self.app.status.get(), "Results released")
 
-    def test_footer_stays_visible_with_long_results_in_small_windows(self):
+    def test_logs_keep_eye_and_toggle_in_place_and_window_compact(self):
+        self.root.deiconify()
+        self.root.update()
+        eye_y = self.app.eye.winfo_rooty() - self.root.winfo_rooty()
+        button_y = self.app.logs_button.winfo_rooty() - self.root.winfo_rooty()
+        for _ in range(3):
+            self.app.toggle_logs()
+            self.root.update()
+            self.assertTrue(self.app.eye.winfo_ismapped())
+            self.assertEqual(self.app.eye.winfo_rooty() - self.root.winfo_rooty(), eye_y)
+            self.assertEqual(self.app.logs_button.winfo_rooty() - self.root.winfo_rooty(), button_y)
+            self.assertGreater(self.app.log_box.winfo_height(), 80)
+            self.assertEqual(self.root.winfo_width(), 772)
+            self.app.toggle_logs()
+            self.root.update()
+            self.assertEqual(self.root.winfo_height(), 650)
+        self.assertEqual(self.root.resizable(), (0, 0))
+
+    def test_paused_and_stopped_eye_closes_and_keeps_glow(self):
+        self.app.running = True
+        with patch("prc_result_alarm.time.monotonic", return_value=2):
+            for paused in (False, True, False):
+                self.app.paused.set() if paused else self.app.paused.clear()
+                self.root.after_cancel(self.app.eye_job)
+                self.app.animate_eye()
+                self.assertEqual(bool(self.app.eye.find_withtag("closed_lid")), paused)
+                self.assertEqual(bool(self.app.eye.find_withtag("iris")), not paused)
+                self.assertTrue(self.app.eye.find_withtag("glow"))
+            self.app.stop.set()
+            self.root.after_cancel(self.app.eye_job)
+            self.app.animate_eye()
+            self.assertTrue(self.app.eye.find_withtag("closed_lid"))
+
+    def test_settings_opens_directly_and_contains_alarm_sounds(self):
+        self.app.show_settings()
+        self.assertEqual(self.app.current_view, "settings")
+        sound_link = next(widget for widget in self.app.settings_panel.winfo_children()
+                          if "Alarm sounds" in str(widget.cget("text")))
+        sound_link.invoke()
+        self.assertEqual(self.app.current_view, "sounds")
+        self.assertFalse(hasattr(self.app, "reduce_motion"))
+
+    def test_logs_include_watched_sources_and_clickable_results(self):
+        for _, url in prc_result_alarm.SOURCES:
+            self.assertIn(url, self.app.log_box.get("1.0", "end"))
+        self.app.events.put(("checking", 0, None))
+        self.app.pump()
+        self.assertIn(prc_result_alarm.SOURCES[0][1], self.app.log_box.get("end-3l", "end"))
         self.app.play = Mock()
-        self.app.auto_open.set(False)
-        title = ("October 2026 Pharmacists Licensure Examination Results Released "
-                 "in Four Working Days with Full List of Successful Examinees")
-        with patch.object(self.root, "deiconify"), patch.object(self.root, "lift"), \
-                patch.object(self.root, "attributes"):
-            self.app.show_match(Found(Article(title, "https://prc.gov.ph/node/1"), (Watch(),)))
-        outer = self.root.winfo_children()[0]
-        footer = next(child for child in outer.winfo_children()
-                      if child.winfo_class() == "TLabel"
-                      and str(child.cget("text")).startswith("Keep this app open"))
-        for size in ("860x740", "760x680", "1000x800"):
-            with self.subTest(size=size):
-                self.root.geometry(size)
-                self.root.update_idletasks()
-                self.assertGreaterEqual(footer.winfo_height(), footer.winfo_reqheight())
-                self.assertLessEqual(footer.winfo_y() + footer.winfo_height(), outer.winfo_height())
-                self.assertGreater(self.app.result_tree.winfo_height(), 20)
-                self.app.notebook.select(0)
-                self.root.update_idletasks()
-                self.assertGreater(self.app.log_box.winfo_height(), 20)
-                self.app.notebook.select(1)
+        self.app.show_match(Found(Article("Result", "https://prc.gov.ph/node/99"), (Watch(),)))
+        self.app.toggle_logs()
+        self.root.update()
+        tag = f"url_{self.app.log_link_count}"
+        start = self.app.log_box.tag_ranges(tag)[0]
+        x, y, _, height = self.app.log_box.bbox(start)
+        with patch.object(self.app, "open_url") as open_url:
+            self.app.log_box.event_generate("<Motion>", x=x + 10, y=y + height // 2)
+            self.app.log_box.event_generate("<Button-1>", x=x + 10, y=y + height // 2)
+        open_url.assert_called_once_with("https://prc.gov.ph/node/99")
+
+    def test_alarm_controls_remain_visible_with_larger_text_scaling(self):
+        previous = float(self.root.tk.call("tk", "scaling"))
+        try:
+            self.root.tk.call("tk", "scaling", 1.5)
+            self.root.geometry("960x640")
+            self.root.deiconify()
+            self.root.update()
+            self.assertGreater(self.app.sound_box.winfo_height(), 20)
+            self.assertLess(self.app.sound_box.winfo_rooty() + self.app.sound_box.winfo_height(),
+                            self.root.winfo_rooty() + self.root.winfo_height())
+        finally:
+            self.root.tk.call("tk", "scaling", previous)
 
     def test_add_remove_and_restore_multiple_watches(self):
         self.app.exam.set("Nurses")
@@ -122,9 +171,33 @@ class WatcherUITests(unittest.TestCase):
         self.assertEqual(prc_result_alarm.load_watches(self.app.settings_path), self.app.watches)
         self.app.add_watch()
         self.assertEqual(len(self.app.watches), 2)
-        self.app.watch_tree.selection_set("1")
+        self.app.select_watch(1)
         self.app.remove_watch()
         self.assertEqual(self.app.watches, [Watch()])
+
+    def test_edit_watch_keeps_its_alarm(self):
+        source = Path(self.preferences.name) / "selected.wav"
+        prc_result_alarm.create_alarm(source)
+        imported = prc_result_alarm.import_sound(source, self.app.settings_path.parent)
+        self.app.refresh_sounds()
+        self.app.watches = [Watch(Target(), imported)]
+        self.app.refresh_watches()
+        self.app.exam.set("Nurses")
+        self.app.add_watch(edit_index=0)
+        self.assertEqual(self.app.watches[0].target.exam, "Nurses")
+        self.assertEqual(self.app.watches[0].sound, imported)
+        self.assertEqual(len(self.app.watches), 1)
+
+    def test_watch_cards_scroll_when_many_exams_are_saved(self):
+        self.app.watches = [Watch(Target("October", str(2026 + year), "Pharmacists"))
+                            for year in range(10)]
+        self.app.refresh_watches()
+        self.root.deiconify()
+        self.root.update()
+        first = self.app.watch_cards.winfo_children()[0]
+        first.event_generate("<MouseWheel>", delta=-120)
+        self.root.update()
+        self.assertGreater(self.app.watch_list.yview()[0], 0)
 
     def test_all_boards_gets_new_only_and_no_date_filter_by_default(self):
         self.app.exam.set(prc_result_alarm.ALL_EXAMS)
@@ -134,10 +207,20 @@ class WatcherUITests(unittest.TestCase):
                                                    new_only=True))
 
     def test_simultaneous_alerts_keep_distinct_sounds_and_both_links(self):
+        pharmacy_sound = Path(self.preferences.name) / "pharmacy.wav"
+        nurses_sound = Path(self.preferences.name) / "nurses.wav"
+        prc_result_alarm.create_alarm(pharmacy_sound)
+        prc_result_alarm.create_alarm(nurses_sound)
+        first_path = prc_result_alarm.import_sound(pharmacy_sound, self.app.settings_path.parent)
+        second_path = prc_result_alarm.import_sound(nurses_sound, self.app.settings_path.parent)
+        self.app.watches = [Watch(Target(), first_path),
+                            Watch(Target("", "", "Nurses"), second_path)]
+        self.app.refresh_sounds()
+        self.app.refresh_watches()
         one = Found(Article("Pharmacy result", "https://prc.gov.ph/node/1"),
-                    (Watch(Target(), "pharmacy.wav"),))
+                    (self.app.watches[0],))
         two = Found(Article("Nurses result", "https://prc.gov.ph/node/2"),
-                    (Watch(Target("", "", "Nurses"), "nurses.wav"),))
+                    (self.app.watches[1],))
         self.app.play = Mock()
         self.app.auto_open.set(False)
         with patch.object(self.root, "deiconify"), patch.object(self.root, "lift"), \
@@ -148,19 +231,24 @@ class WatcherUITests(unittest.TestCase):
             self.assertEqual(len(self.app.pending_alerts), 1)
             self.app.next_alert()
         self.assertEqual([call.args[0] for call in self.app.play.call_args_list],
-                         ["pharmacy.wav", "nurses.wav"])
+                         [first_path, second_path])
         self.assertEqual(len(self.app.results), 2)
-        self.assertEqual(len(self.app.result_tree.get_children()), 2)
+        for found in (one, two):
+            self.assertIn(found.article.url, self.app.log_box.get("1.0", "end"))
         self.assertEqual(self.app.match, two.article)
 
-    def test_selected_watch_sound_is_previewed_for_30_seconds(self):
-        self.app.watches = [Watch(Target(), "selected.wav")]
+    def test_selected_watch_sound_is_tested_for_30_seconds(self):
+        sound = Path(self.preferences.name) / "selected.wav"
+        prc_result_alarm.create_alarm(sound)
+        imported = prc_result_alarm.import_sound(sound, self.app.settings_path.parent)
+        self.app.watches = [Watch(Target(), imported)]
+        self.app.refresh_sounds()
         self.app.refresh_watches()
         self.app.play = Mock()
         with patch.object(self.root, "after", wraps=self.root.after) as schedule:
             self.app.test_alarm()
-        self.app.play.assert_called_once_with("selected.wav")
-        schedule.assert_called_once_with(30000, self.app.silence)
+        self.app.play.assert_called_once_with(imported)
+        schedule.assert_called_once_with(30000, self.app.stop_sound)
 
     def test_missing_custom_sound_falls_back_to_generated_melody(self):
         with patch("winsound.PlaySound") as audio:
@@ -190,13 +278,15 @@ class WatcherUITests(unittest.TestCase):
         self.assertEqual(backups[0].read_bytes(), original)
         self.assertEqual(len(prc_result_alarm.load_watches(path)), 2)
 
-    def test_sound_picker_saves_the_selected_watch_only(self):
+    def test_sound_library_assigns_selected_watch_only(self):
         self.app.exam.set("Nurses")
         self.app.add_watch()
         sound = Path(self.preferences.name) / "nurses.wav"
         prc_result_alarm.create_alarm(sound)
         with patch("tkinter.filedialog.askopenfilename", return_value=str(sound)):
-            self.app.choose_sound()
+            self.app.add_sound()
+        self.app.sound_choice.set("nurses.wav")
+        self.app.assign_sound()
         saved = prc_result_alarm.load_watches(self.app.settings_path)
         self.assertEqual(saved[0].sound, "")
         imported = self.app.settings_path.parent / saved[1].sound
@@ -205,6 +295,48 @@ class WatcherUITests(unittest.TestCase):
         self.assertEqual(imported.name, sound.name)
         self.app.use_default_sound()
         self.assertEqual(prc_result_alarm.load_watches(self.app.settings_path)[1].sound, "")
+
+    def test_removing_sound_resets_assigned_watches_and_keeps_original(self):
+        source = Path(self.preferences.name) / "alarm-copy.wav"
+        prc_result_alarm.create_alarm(source)
+        imported = prc_result_alarm.import_sound(source, self.app.settings_path.parent)
+        self.app.refresh_sounds()
+        self.app.watches = [Watch(Target(), imported),
+                            Watch(Target("", "", "Nurses"), imported)]
+        self.app.store_watches(self.app.watches)
+        self.app.sound_tree.selection_set("0")
+        self.app.remove_sound()
+        self.assertEqual([watch.sound for watch in self.app.watches], ["", ""])
+        self.assertEqual([watch.sound for watch in prc_result_alarm.load_watches(self.app.settings_path)],
+                         ["", ""])
+        self.assertFalse((self.app.settings_path.parent / imported).exists())
+        self.assertTrue(source.exists())
+
+    def test_preview_stops_without_creating_result_and_real_alert_takes_priority(self):
+        self.app.auto_open.set(False)
+        self.app.play = Mock()
+        self.app.preview_alert()
+        self.assertEqual(self.app.status.get(), "Results released")
+        self.assertIn("preview", self.app.detail.get())
+        self.assertEqual(self.app.results, [])
+        alert = Found(Article("October 2026 Pharmacists Licensure Examination Results",
+                              "https://prc.gov.ph/node/1"), (Watch(),))
+        with patch.object(self.root, "deiconify"), patch.object(self.root, "lift"), \
+                patch.object(self.root, "attributes"):
+            self.app.show_match(alert)
+        self.assertIsNone(self.app.preview)
+        self.assertEqual(self.app.status.get(), "Results released")
+        self.assertEqual(len(self.app.results), 1)
+        self.assertEqual(self.app.play.call_count, 2)
+
+    def test_preferences_survive_restart(self):
+        self.app.auto_open.set(True)
+        self.app.save_options()
+        self.app.close()
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.app = WatcherApp(self.root, settings_path=Path(self.preferences.name) / "watchlist.json")
+        self.assertTrue(self.app.auto_open.get())
 
     def test_empty_watch_list_cannot_start_and_edits_wait_for_worker(self):
         self.app.running = True
@@ -223,8 +355,7 @@ class WatcherUITests(unittest.TestCase):
     def test_add_and_duplicate_watch_have_visible_feedback(self):
         self.app.exam.set("Nurses")
         self.app.add_watch()
-        self.dialogs["showinfo"].assert_called_once()
-        self.assertIn("Nurses", self.dialogs["showinfo"].call_args.args[1])
+        self.assertIn("Added Nurses", self.app.log_box.get("1.0", "end"))
         self.app.add_watch()
         self.dialogs["showwarning"].assert_called_once()
         self.assertEqual(len(self.app.watches), 2)

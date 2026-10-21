@@ -16,6 +16,7 @@ import sys
 import tempfile
 import threading
 import time
+import tkinter as tk
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -27,7 +28,8 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
-from app_files import data_directory, import_sound, migrate_settings, validate_sound
+from app_files import (available_sounds, data_directory, import_sound, load_preferences,
+                       migrate_settings, save_preferences, validate_sound)
 from watches import ALL_EXAMS, EXAMS, EXCLUDED_NOTICE, Target, Watch, load_watches, normalize, save_watches
 
 SOURCES = (
@@ -229,22 +231,29 @@ def fetch_page(url: str) -> str:
         raise CheckError("Connection failed or timed out. Check your internet and PRC manually.") from exc
 
 
-def monitor(watches: list[Watch], stop: threading.Event, events: queue.Queue, fetch=fetch_page):
+def monitor(watches: list[Watch], stop: threading.Event, events: queue.Queue, fetch=fetch_page,
+            pause: threading.Event | None = None, get_watches=None):
     due = [0.0] * len(SOURCES)
     failures = [0] * len(SOURCES)
-    initialized = [False] * len(SOURCES)
-    seen = [set() for _ in watches]
+    initialized = set()
+    seen = {}
     announced = set()
     try:
-        while watches and not stop.is_set():
+        while (get_watches() if get_watches else watches) and not stop.is_set():
+            while pause is not None and pause.is_set():
+                if stop.wait(.2):
+                    return
             for index, (_, url) in enumerate(SOURCES):
                 if stop.is_set():
                     return
+                if pause is not None and pause.is_set():
+                    break
                 if time.monotonic() < due[index]:
                     continue
                 events.put(("checking", index, None))
                 try:
                     articles = inspect_page(fetch(url), url)
+                    active_watches = get_watches() if get_watches else watches
                     if stop.is_set():
                         return
                     for article in articles:
@@ -252,19 +261,20 @@ def monitor(watches: list[Watch], stop: threading.Event, events: queue.Queue, fe
                             return
                         keys = article.keys()
                         matching = []
-                        for watch_index, watch in enumerate(watches):
+                        for watch in active_watches:
                             if not article.matches(watch.target):
                                 continue
-                            baseline = watch.new_only and not initialized[index]
-                            if not baseline and not keys.intersection(seen[watch_index]):
+                            known = seen.setdefault(watch.target, set())
+                            baseline = watch.new_only and (watch.target, index) not in initialized
+                            if not baseline and not keys.intersection(known):
                                 matching.append(watch)
-                            seen[watch_index].update(keys)
+                            known.update(keys)
                         if matching and not keys.intersection(announced):
                             # A specific exam's sound wins over an overlapping all-board watch.
                             matching.sort(key=lambda watch: watch.target.is_all)
                             events.put(("found", index, Found(article, tuple(matching))))
                             announced.update(keys)
-                    initialized[index] = True
+                    initialized.update((watch.target, index) for watch in active_watches)
                     failures[index] = 0
                     due[index] = time.monotonic() + INTERVAL
                     events.put(("ok", index, due[index]))
@@ -305,13 +315,14 @@ class WatcherApp:
         self.root = root
         self.events = queue.Queue()
         self.stop = threading.Event()
+        self.paused = threading.Event()
         self.worker = None
         self.running = False
+        self.started_once = False
         self.match = None
         self.current_alert = None
         self.pending_alerts = deque()
         self.results = []
-        self.found_counts = {}
         self.settings_path = settings_path or data_directory() / "watchlist.json"
         settings_error = ""
         try:
@@ -328,7 +339,15 @@ class WatcherApp:
         self.topmost_job = None
         self.alarm_active = False
         self.source_state = ["idle", "idle"]
-        self.next_checks = [0.0, 0.0]
+        self.last_checked = None
+        self.preview = None
+        self.preview_job = None
+        self.sound_mode = None
+        self.notice_job = None
+        self.current_view = "watch"
+        self.logs_open = False
+        preferences = load_preferences(self.settings_path.parent)
+        self.auto_open = tk.BooleanVar(value=preferences["auto_open"])
         self.tempdir = tempfile.TemporaryDirectory(prefix="prc_alarm_")
         self.sound_file = self.settings_path.parent / "alarm.wav"
         if not self.sound_file.is_file():
@@ -336,227 +355,606 @@ class WatcherApp:
             create_alarm(self.sound_file)
 
         root.title("PRC Result Alarm")
-        root.geometry("860x740")
-        root.minsize(760, 680)
-        colors = {
-            "background": "#f7f3fc", "surface": "#ffffff", "lavender": "#eee5fa",
-            "ink": "#352347", "muted": "#6e5b80", "accent": "#7744b5",
-            "hover": "#65349f", "border": "#d9c9eb", "error": "#a12f55",
-        }
-        root.configure(bg=colors["background"])
+        root.geometry("772x650")
+        root.resizable(False, False)
+        root.minsize(772, 650)
+        root.maxsize(772, 650)
+        self.colors = c = {"background": "#0d0c11", "surface": "#201d29",
+                           "main": "#17151e", "input": "#211e2a",
+                           "ink": "#faf7ff", "muted": "#cbb8e8", "accent": "#c4a0f1",
+                           "selected": "#33253f", "border": "#3c3546",
+                           "amber": "#e7b568", "error": "#e6a0ac"}
+        root.configure(bg=c["background"])
         style = ttk.Style()
         style.theme_use("clam")
-        style.configure(".", font=("Segoe UI", 10), foreground=colors["ink"])
-        style.configure("TFrame", background=colors["background"])
-        style.configure("TLabel", background=colors["background"])
-        style.configure("Muted.TLabel", foreground=colors["muted"])
-        style.configure("Error.TLabel", foreground=colors["error"])
-        style.configure("Panel.TFrame", background=colors["lavender"])
-        style.configure("Panel.TLabel", background=colors["lavender"])
-        style.configure("Detail.TLabel", background=colors["lavender"], foreground=colors["muted"])
-        style.configure("TButton", padding=(10, 3), background=colors["lavender"],
-                        foreground=colors["accent"], borderwidth=0, focusthickness=1,
-                        focuscolor=colors["accent"])
-        style.map("TButton", background=[("active", colors["border"])],
-                  foreground=[("disabled", colors["muted"])])
-        style.configure("Accent.TButton", background=colors["accent"], foreground="white",
-                        font=("Segoe UI", 10, "bold"), focuscolor="white")
-        style.map("Accent.TButton",
-                  background=[("disabled", colors["border"]), ("active", colors["hover"])],
-                  foreground=[("disabled", colors["muted"]), ("active", "white")])
-        # Rounded backgrounds keep ttk's native keyboard and focus behavior.
-        link_layout = style.layout("TButton")
-        self.button_images = []
-        for name, fills in (
-                ("TButton", (colors["lavender"], colors["border"], colors["lavender"])),
-                ("Accent.TButton", (colors["accent"], colors["hover"], colors["border"]))):
-            images = []
-            for fill in fills:
-                image = tk.PhotoImage(width=24, height=24)
-                for y in range(24):
-                    distance = max(0, 7.5 - y, y - 15.5)
-                    inset = math.ceil(7.5 - math.sqrt(7.5 ** 2 - distance ** 2))
-                    image.put(fill, to=(inset, y, 24 - inset, y + 1))
-                images.append(image)
-            self.button_images.extend(images)
-            element = f"{name}.rounded"
-            style.element_create(element, "image", images[0], ("disabled", images[2]),
-                                 ("pressed", images[1]), ("active", images[1]), border=8, sticky="nsew")
-            style.layout(name, [(element, {"sticky": "nsew", "children": [
-                ("Button.focus", {"sticky": "nsew", "children": [
-                    ("Button.padding", {"sticky": "nsew", "children": [
-                        ("Button.label", {"sticky": "nsew"})]})]})]})])
-        style.configure("Link.TButton", background=colors["background"], padding=(8, 6))
-        style.layout("Link.TButton", link_layout)
-        style.map("Link.TButton", background=[("active", colors["lavender"])])
-        style.configure("TCheckbutton", background=colors["background"], padding=0,
-                        indicatorbackground="white", indicatorforeground=colors["accent"])
-        style.map("TCheckbutton", background=[("active", colors["background"])])
-        for name in ("TEntry", "TCombobox"):
-            style.configure(name, padding=8, fieldbackground="white", bordercolor=colors["border"],
-                            lightcolor=colors["border"], darkcolor=colors["border"],
-                            arrowcolor=colors["accent"], selectbackground=colors["accent"],
-                            selectforeground="white")
-            style.map(name, fieldbackground=[("disabled", colors["lavender"]), ("readonly", "white")],
-                      foreground=[("disabled", colors["muted"])],
-                      bordercolor=[("focus", colors["accent"])])
-        root.option_add("*TCombobox*Listbox.font", ("Segoe UI", 10))
-        root.option_add("*TCombobox*Listbox.selectBackground", colors["accent"])
-        root.option_add("*TCombobox*Listbox.selectForeground", "white")
-        style.configure("TSeparator", background=colors["border"])
-        style.configure("Vertical.TScrollbar", background=colors["lavender"],
-                        troughcolor="white", arrowcolor=colors["muted"], borderwidth=0)
-        style.configure("Treeview", background="white", fieldbackground="white",
-                        rowheight=28, borderwidth=0, foreground=colors["ink"])
-        style.configure("Treeview.Heading", background=colors["lavender"], relief="flat",
-                        font=("Segoe UI", 9, "bold"), padding=(8, 6))
-        style.map("Treeview", background=[("selected", colors["accent"])],
-                  foreground=[("selected", "white")])
-        style.configure("TNotebook", background=colors["background"], borderwidth=0)
-        style.configure("TNotebook.Tab", padding=(12, 6), background=colors["background"])
-        style.map("TNotebook.Tab", background=[("selected", colors["lavender"])],
-                  foreground=[("selected", colors["accent"])])
-        outer = ttk.Frame(root, padding=16)
-        outer.pack(fill="both", expand=True)
-        header = ttk.Frame(outer)
-        header.pack(fill="x", pady=(0, 10))
-        ttk.Label(header, text="PRC Result Alarm", font=("Segoe UI", 22, "bold")).pack(side="left")
-        self.start_button = ttk.Button(header, text="Start watching", style="Accent.TButton", command=self.start)
-        self.start_button.pack(side="right")
-        settings = ttk.Frame(outer)
-        settings.pack(fill="x")
-        for column, weight in enumerate((4, 2, 1, 0)):
-            settings.columnconfigure(column, weight=weight)
-        for column, text in enumerate(("Exam (or type its name)", "Exam month", "Year (optional)")):
-            ttk.Label(settings, text=text, style="Muted.TLabel").grid(
-                row=0, column=column, sticky="w", padx=(0 if column == 0 else 10, 0))
+        style.configure(".", font=("Segoe UI", 10), foreground=c["ink"], background=c["main"])
+        style.configure("TFrame", background=c["main"])
+        style.configure("Surface.TFrame", background=c["surface"])
+        style.configure("TLabel", background=c["main"], foreground=c["ink"])
+        style.configure("Surface.TLabel", background=c["surface"], foreground=c["ink"])
+        style.configure("Muted.TLabel", background=c["surface"], foreground=c["muted"])
+        style.configure("Main.TLabel", background=c["main"], foreground=c["ink"])
+        style.configure("MainMuted.TLabel", background=c["main"], foreground=c["muted"])
+        style.configure("TButton", padding=(10, 7), background=c["input"],
+                        foreground=c["ink"], borderwidth=1, bordercolor=c["border"],
+                        lightcolor=c["border"], darkcolor=c["border"], relief="flat")
+        style.map("TButton", background=[("active", c["selected"])],
+                  foreground=[("disabled", c["muted"])])
+        style.configure("Accent.TButton", background=c["accent"], foreground="#18131f",
+                        borderwidth=0)
+        style.map("Accent.TButton", background=[("disabled", "#a58bc2"), ("active", "#d4b5fa")],
+                  foreground=[("disabled", "#21162e")])
+        style.configure("Transport.TButton", font=("Segoe UI", 10, "bold"), padding=(16, 9),
+                        background=c["accent"], foreground="#18131f", borderwidth=0)
+        style.map("Transport.TButton", background=[("active", "#d4b5fa")],
+                  foreground=[("disabled", "#51405f")])
+        style.configure("Compact.TButton", padding=(5, 7), background=c["input"],
+                        foreground=c["ink"], borderwidth=1, bordercolor=c["border"],
+                        lightcolor=c["border"], darkcolor=c["border"], relief="flat")
+        style.map("Compact.TButton", background=[("active", c["selected"])])
+        style.configure("Link.TButton", background=c["surface"], foreground=c["muted"],
+                        borderwidth=0, padding=(3, 5))
+        style.map("Link.TButton", background=[("active", c["surface"])],
+                  foreground=[("active", c["accent"])])
+        style.configure("MainLink.TButton", background=c["main"], foreground=c["muted"],
+                        borderwidth=0, padding=(3, 5))
+        style.map("MainLink.TButton", background=[("active", c["main"])],
+                  foreground=[("active", c["accent"])])
+        style.configure("TEntry", padding=7, fieldbackground=c["input"], foreground=c["ink"],
+                        bordercolor=c["border"], insertcolor=c["ink"])
+        style.configure("TCombobox", padding=7, fieldbackground=c["input"], foreground=c["ink"],
+                        background=c["input"], bordercolor=c["border"], arrowcolor=c["muted"],
+                        lightcolor=c["border"], darkcolor=c["border"], borderwidth=1)
+        style.map("TCombobox", fieldbackground=[("readonly", c["input"])],
+                  foreground=[("readonly", c["ink"])],
+                  selectbackground=[("readonly", c["input"])],
+                  selectforeground=[("readonly", c["ink"])])
+        style.configure("TCheckbutton", background=c["surface"], foreground=c["muted"])
+        style.map("TCheckbutton", background=[("active", c["surface"])])
+        style.configure("Main.TCheckbutton", background=c["main"], foreground=c["muted"])
+        style.map("Main.TCheckbutton", background=[("active", c["main"])])
+        style.configure("Treeview", background=c["surface"], fieldbackground=c["surface"],
+                        foreground=c["ink"], rowheight=32, borderwidth=0)
+        style.map("Treeview", background=[("selected", c["selected"])],
+                  foreground=[("selected", c["ink"])])
+        style.configure("Treeview.Heading", background=c["surface"],
+                        foreground=c["muted"], font=("Segoe UI", 9, "bold"))
+        style.configure("Vertical.TScrollbar", background=c["border"], troughcolor=c["surface"],
+                        bordercolor=c["surface"], lightcolor=c["border"], darkcolor=c["border"],
+                        arrowcolor=c["muted"], gripcount=0, borderwidth=0)
+        style.map("Vertical.TScrollbar", background=[("active", c["selected"])])
+
         self.exam = tk.StringVar(value="Pharmacists")
         self.month = tk.StringVar(value="October")
         self.year = tk.StringVar(value="2026")
-        self.exam_box = ttk.Combobox(settings, textvariable=self.exam,
-                                    values=[ALL_EXAMS, *sorted(EXAMS)], width=25)
-        self.exam_box.grid(row=1, column=0, pady=(4, 0), sticky="ew")
-        self.exam_box.bind("<<ComboboxSelected>>", self.exam_changed)
-        self.month_box = ttk.Combobox(settings, textvariable=self.month, state="readonly",
-                                      values=["Any month", *list(calendar.month_name)[1:]], width=12)
-        self.month_box.grid(row=1, column=1, padx=(10, 0), pady=(4, 0), sticky="ew")
-        self.year_box = ttk.Entry(settings, textvariable=self.year, width=6)
-        self.year_box.grid(row=1, column=2, padx=(10, 0), pady=(4, 0), sticky="ew")
-        self.add_button = ttk.Button(settings, text="Add watch", command=self.add_watch)
-        self.add_button.grid(row=1, column=3, padx=(10, 0), pady=(4, 0), sticky="ew")
-        options = ttk.Frame(outer)
-        options.pack(fill="x", pady=(8, 10))
         self.new_only = tk.BooleanVar(value=False)
-        self.new_only_box = ttk.Checkbutton(options, text="New announcements only", variable=self.new_only)
-        self.new_only_box.pack(side="left")
-        self.auto_open = tk.BooleanVar(value=True)
-        ttk.Checkbutton(options, text="Open results automatically", variable=self.auto_open).pack(side="right")
+        self.selection_index = 0 if self.watches else None
+        self.form_edit_index = None
 
-        watch_frame = ttk.Frame(outer)
-        watch_frame.pack(fill="x")
-        self.watch_tree = ttk.Treeview(watch_frame, columns=("exam", "period", "sound", "status"),
-                                      show="headings", selectmode="browse", height=3)
-        for name, title, width in (("exam", "Watching", 240), ("period", "Exam date", 135),
-                                   ("sound", "Sound", 165), ("status", "Status", 135)):
-            self.watch_tree.heading(name, text=title, anchor="w")
-            self.watch_tree.column(name, width=width, minwidth=85, anchor="w")
-        watch_scroll = ttk.Scrollbar(watch_frame, command=self.watch_tree.yview)
-        self.watch_tree.configure(yscrollcommand=watch_scroll.set)
-        watch_scroll.pack(side="right", fill="y")
-        self.watch_tree.pack(side="left", fill="x", expand=True)
-        self.watch_tree.bind("<<TreeviewSelect>>", lambda event: self.update_controls())
-        actions = ttk.Frame(outer)
-        actions.pack(fill="x", pady=(8, 10))
-        self.sound_button = ttk.Button(actions, text="Choose sound", command=self.choose_sound)
-        self.default_button = ttk.Button(actions, text="Use default", command=self.use_default_sound)
-        self.test_button = ttk.Button(actions, text="Test (30s)", command=self.test_alarm)
-        self.silence_button = ttk.Button(actions, text="Silence alarm", command=self.silence, state="disabled")
-        self.remove_button = ttk.Button(actions, text="Remove", command=self.remove_watch)
-        for button in (self.sound_button, self.default_button, self.test_button,
-                       self.silence_button, self.remove_button):
-            button.pack(side="left", padx=(0, 6))
-        ttk.Button(actions, text="Open PRC", style="Link.TButton",
+        outer = ttk.Frame(root, style="Surface.TFrame")
+        outer.pack(fill="both", expand=True, padx=6, pady=5)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(2, weight=1)
+        header = ttk.Frame(outer, style="Surface.TFrame", padding=(24, 18))
+        header.grid(row=0, column=0, sticky="ew")
+        bell = tk.Canvas(header, width=32, height=32, bg=c["selected"], highlightthickness=0)
+        bell.pack(side="left", padx=(0, 10))
+        bell.create_arc(10, 8, 22, 23, start=0, extent=180, style="arc",
+                        outline=c["accent"], width=1)
+        bell.create_line(10, 18, 8, 22, 24, 22, 22, 18, fill=c["accent"], smooth=True)
+        bell.create_oval(15, 24, 17, 26, fill=c["accent"], outline="")
+        ttk.Label(header, text="PRC Result Alarm", style="Surface.TLabel",
+                  font=("Segoe UI", 11, "bold")).pack(side="left")
+        self.start_button = ttk.Button(header, text="▶  Start", width=10,
+                                       style="Transport.TButton", command=self.start)
+        self.start_button.pack(side="right")
+        tk.Frame(outer, bg=c["border"], height=1).grid(row=1, column=0, sticky="ew")
+
+        body = ttk.Frame(outer, style="Surface.TFrame")
+        self.body = body
+        body.grid(row=2, column=0, sticky="nsew")
+        sidebar = ttk.Frame(body, style="Surface.TFrame", width=220, padding=(16, 29, 16, 19))
+        sidebar.pack(side="left", fill="y")
+        sidebar.pack_propagate(False)
+        ttk.Label(sidebar, text="WATCHES", style="Muted.TLabel",
+                  font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(0, 12))
+        self.watch_list = tk.Canvas(sidebar, width=188, height=72, bg=c["surface"],
+                                    highlightthickness=0, bd=0)
+        self.watch_list.pack(fill="x")
+        self.watch_cards = tk.Frame(self.watch_list, bg=c["surface"])
+        self.watch_list.create_window((0, 0), window=self.watch_cards, anchor="nw")
+        self.watch_cards.bind("<Configure>", lambda event: self.watch_list.configure(
+            scrollregion=self.watch_list.bbox("all")))
+        self.watch_list.bind("<MouseWheel>", lambda event: self.watch_list.yview_scroll(
+            -1 if event.delta > 0 else 1, "units"))
+        self.add_link = ttk.Button(sidebar, text="＋  Add exam", style="Link.TButton",
+                                   command=self.show_add_dialog)
+        self.add_link.pack(anchor="w", pady=(12, 0))
+        self.form_frame = ttk.Frame(sidebar, style="Surface.TFrame")
+        ttk.Label(self.form_frame, text="Exam", style="Muted.TLabel",
+                  font=("Segoe UI", 9)).pack(anchor="w", pady=(14, 4))
+        self.exam_box = ttk.Combobox(self.form_frame, textvariable=self.exam,
+                                     values=[ALL_EXAMS, *sorted(EXAMS)], width=22)
+        self.exam_box.pack(fill="x")
+        self.exam_box.bind("<<ComboboxSelected>>", self.exam_changed)
+        month_header = ttk.Frame(self.form_frame, style="Surface.TFrame")
+        month_header.pack(fill="x", pady=(20, 4))
+        ttk.Label(month_header, text="Month", style="Muted.TLabel",
+                  font=("Segoe UI", 9)).pack(side="left")
+        self.options_link = ttk.Button(month_header, text="⋯", style="Link.TButton",
+                                        command=self.toggle_form_options)
+        self.options_link.pack(side="right")
+        date_row = ttk.Frame(self.form_frame, style="Surface.TFrame")
+        date_row.pack(fill="x")
+        self.month_box = ttk.Combobox(date_row, textvariable=self.month, state="readonly",
+                                      values=["Any month", *list(calendar.month_name)[1:]], width=12)
+        self.month_box.pack(side="left", fill="x", expand=True)
+        self.year_box = ttk.Entry(date_row, textvariable=self.year, width=5)
+        self.year_box.pack(side="left", padx=(3, 0))
+        self.new_only_box = ttk.Checkbutton(self.form_frame, text="New announcements only",
+                                             variable=self.new_only)
+        self.add_button = ttk.Button(self.form_frame, text="Add", style="Accent.TButton",
+                                      command=self.add_watch)
+        self.add_button.pack(fill="x", pady=(13, 0))
+        ttk.Frame(sidebar, style="Surface.TFrame").pack(fill="both", expand=True)
+        ttk.Button(sidebar, text="⚙  Settings", style="Link.TButton",
+                   command=self.show_settings).pack(anchor="w")
+        tk.Frame(body, bg=c["border"], width=1).pack(side="left", fill="y")
+
+        self.content = ttk.Frame(body, style="TFrame", padding=(30, 28))
+        self.content.pack(side="left", fill="both", expand=True)
+        self.watch_panel = ttk.Frame(self.content)
+        self.watch_panel.pack(fill="both", expand=True)
+        self.watch_name = tk.StringVar()
+        self.watch_period = tk.StringVar()
+        ttk.Label(self.watch_panel, textvariable=self.watch_name, style="Main.TLabel",
+                  font=("Segoe UI", 15, "bold")).pack(anchor="w")
+        ttk.Label(self.watch_panel, textvariable=self.watch_period,
+                  style="MainMuted.TLabel", font=("Segoe UI", 10)).pack(anchor="w", pady=(2, 0))
+        center = ttk.Frame(self.watch_panel)
+        center.pack(fill="x")
+        self.eye = tk.Canvas(center, width=220, height=145, bg=c["main"],
+                             highlightthickness=0)
+        self.eye.pack(pady=(28, 0))
+        self.status = tk.StringVar(value="Ready")
+        self.detail = tk.StringVar(value="")
+        self.status_label = ttk.Label(center, textvariable=self.status, style="Main.TLabel",
+                                      font=("Segoe UI", 22, "bold"))
+        self.status_label.pack()
+        ttk.Label(center, textvariable=self.detail, style="MainMuted.TLabel",
+                  font=("Segoe UI", 9), wraplength=450, justify="center").pack(pady=(6, 0))
+        self.alert_actions = ttk.Frame(center)
+        self.alert_actions.pack(pady=(12, 0))
+        self.result_button = ttk.Button(self.alert_actions, text="Open results  ↗",
+                                        style="Accent.TButton", command=self.open_result)
+        self.result_button.pack(side="left", padx=4)
+        self.silence_button = ttk.Button(self.alert_actions, text="Silence", command=self.silence)
+        self.silence_button.pack(side="left", padx=4)
+        self.next_button = ttk.Button(self.alert_actions, text="Next alert", command=self.next_alert)
+        self.next_button.pack(side="left", padx=4)
+        self.alert_actions.pack_forget()
+        self.back_button = ttk.Button(self.watch_panel, text="←  Back", style="MainLink.TButton",
+                                       command=self.dismiss_alert)
+        self.divider = tk.Frame(self.watch_panel, bg=c["border"], height=1)
+        self.divider.pack(fill="x", pady=(22, 18))
+        self.alarm_row = ttk.Frame(self.watch_panel)
+        self.alarm_row.pack(fill="x")
+        ttk.Label(self.alarm_row, text="Alarm", style="MainMuted.TLabel",
+                  font=("Segoe UI", 9)).pack(anchor="w")
+        select_row = ttk.Frame(self.alarm_row)
+        select_row.pack(fill="x", pady=(5, 0))
+        self.sound_choice = tk.StringVar()
+        self.sound_box = ttk.Combobox(select_row, textvariable=self.sound_choice, state="readonly")
+        self.sound_box.pack(side="left", fill="x", expand=True)
+        self.sound_box.bind("<<ComboboxSelected>>", self.assign_sound)
+        self.test_button = ttk.Button(select_row, text="Test", command=self.test_alarm,
+                                       style="Compact.TButton", width=5)
+        self.test_button.pack(side="left", padx=(8, 0))
+        ttk.Button(self.alarm_row, text="▷  Preview alert", style="MainLink.TButton",
+                   command=self.preview_alert).pack(anchor="e", pady=(10, 0))
+
+        self.sounds_panel = ttk.Frame(self.content)
+        ttk.Button(self.sounds_panel, text="←  Settings", style="MainLink.TButton",
+                   command=self.show_settings).pack(anchor="w", pady=(0, 12))
+        ttk.Label(self.sounds_panel, text="Alarm sounds", style="Main.TLabel",
+                  font=("Segoe UI", 18, "bold")).pack(anchor="w")
+        ttk.Label(self.sounds_panel, text="Available to every exam", style="MainMuted.TLabel").pack(anchor="w")
+        self.sound_tree = ttk.Treeview(self.sounds_panel, columns=("name",), show="headings", height=8)
+        self.sound_tree.heading("name", text="Sound")
+        self.sound_tree.pack(fill="both", expand=True, pady=(18, 10))
+        sound_actions = ttk.Frame(self.sounds_panel)
+        sound_actions.pack(fill="x")
+        ttk.Button(sound_actions, text="Add sound", style="Accent.TButton",
+                   command=self.add_sound).pack(side="left", padx=(0, 7))
+        self.library_test_button = ttk.Button(sound_actions, text="Test", command=self.test_library_sound)
+        self.library_test_button.pack(side="left", padx=(0, 7))
+        ttk.Button(sound_actions, text="Remove", command=self.remove_sound).pack(side="left")
+
+        self.settings_panel = ttk.Frame(self.content)
+        ttk.Label(self.settings_panel, text="Settings", style="Main.TLabel",
+                  font=("Segoe UI", 18, "bold")).pack(anchor="w", pady=(0, 18))
+        ttk.Label(self.settings_panel, text="Alerts", style="MainMuted.TLabel").pack(anchor="w")
+        ttk.Checkbutton(self.settings_panel, text="Open results automatically",
+                        variable=self.auto_open, command=self.save_options,
+                        style="Main.TCheckbutton").pack(anchor="w", pady=6)
+        ttk.Button(self.settings_panel, text="♬  Alarm sounds  →", command=self.show_sounds).pack(
+            anchor="w", pady=(24, 6))
+        ttk.Label(self.settings_panel, text="Add, test, or remove your alarm sounds.",
+                  style="MainMuted.TLabel").pack(anchor="w")
+        ttk.Button(self.settings_panel, text="←  Back to watch", style="MainLink.TButton",
+                   command=lambda: self.show_view("watch")).pack(anchor="w", pady=(32, 0))
+
+        footer = ttk.Frame(outer, style="Surface.TFrame", padding=(22, 8))
+        footer.grid(row=4, column=0, sticky="ew")
+        tk.Frame(outer, bg=c["border"], height=1).grid(row=3, column=0, sticky="ew")
+        self.logs_button = ttk.Button(footer, text="＋  Show logs", width=12, style="Link.TButton",
+                                     command=self.toggle_logs)
+        self.logs_button.pack(side="left")
+        self.notice = tk.StringVar()
+        ttk.Label(footer, textvariable=self.notice, style="Muted.TLabel").pack(side="left", padx=12)
+        ttk.Button(footer, text="prc.gov.ph", style="Link.TButton",
                    command=lambda: self.open_url(SOURCES[0][1])).pack(side="right")
-        self.edit_controls = (self.exam_box, self.month_box, self.year_box, self.add_button,
-                              self.new_only_box)
-
-        panel = ttk.Frame(outer, style="Panel.TFrame", padding=12)
-        panel.pack(fill="x")
-        panel.columnconfigure(0, weight=1)
-        self.status = tk.StringVar(value="Ready when you are")
-        self.detail = tk.StringVar(value="Add your exams, choose their sounds, then start.")
-        self.countdown = tk.StringVar(value="Checks every 2 minutes")
-        status_label = ttk.Label(panel, textvariable=self.status, style="Panel.TLabel",
-                                font=("Segoe UI", 15, "bold"), wraplength=510)
-        status_label.grid(row=0, column=0, sticky="w")
-        detail_label = ttk.Label(panel, textvariable=self.detail, style="Detail.TLabel", wraplength=510)
-        detail_label.grid(row=1, column=0, sticky="w", pady=(3, 5))
-        ttk.Label(panel, textvariable=self.countdown, style="Detail.TLabel",
-                  font=("Segoe UI", 9)).grid(row=2, column=0, sticky="w")
-        self.result_button = ttk.Button(panel, text="View result", command=self.open_result, state="disabled")
-        self.result_button.grid(row=0, column=1, sticky="e", padx=(12, 0))
-        self.next_button = ttk.Button(panel, text="Next alert", command=self.next_alert, state="disabled")
-        self.next_button.grid(row=1, column=1, rowspan=2, sticky="e", padx=(12, 0), pady=(4, 0))
-        panel.bind("<Configure>", lambda event: (
-            status_label.configure(wraplength=max(1, event.width - 180)),
-            detail_label.configure(wraplength=max(1, event.width - 180))))
-
-        sources = ttk.Frame(outer)
-        sources.pack(fill="x", pady=(8, 6))
-        sources.columnconfigure(1, weight=1)
-        self.source_labels = [tk.StringVar(value="Not checked") for _ in SOURCES]
-        self.source_widgets = []
-        for index, (name, _) in enumerate(SOURCES):
-            ttk.Label(sources, text=name).grid(row=index, column=0, sticky="w", pady=1)
-            label = ttk.Label(sources, textvariable=self.source_labels[index], style="Muted.TLabel")
-            label.grid(row=index, column=1, sticky="e", pady=1)
-            self.source_widgets.append(label)
-
-        self.notebook = ttk.Notebook(outer)
-        results_frame = ttk.Frame(self.notebook)
-        self.result_tree = ttk.Treeview(results_frame, columns=("exam", "title"), show="headings",
-                                       selectmode="browse", height=3)
-        self.result_tree.heading("exam", text="Exam", anchor="w")
-        self.result_tree.heading("title", text="Announcement · double-click to open", anchor="w")
-        self.result_tree.column("exam", width=200, minwidth=120)
-        self.result_tree.column("title", width=500, minwidth=250)
-        results_scroll = ttk.Scrollbar(results_frame, command=self.result_tree.yview)
-        self.result_tree.configure(yscrollcommand=results_scroll.set)
-        results_scroll.pack(side="right", fill="y")
-        self.result_tree.pack(side="left", fill="both", expand=True)
-        self.result_tree.bind("<Double-1>", self.open_selected_result)
-        self.result_tree.bind("<Return>", self.open_selected_result)
-        log_frame = ttk.Frame(self.notebook)
-        self.log_box = tk.Text(log_frame, height=3, width=1, state="disabled", wrap="word",
-                               font=("Segoe UI", 9), bg=colors["surface"], fg=colors["muted"],
-                               selectbackground=colors["accent"], selectforeground="white",
-                               relief="flat", highlightthickness=1, highlightbackground=colors["border"],
-                               highlightcolor=colors["accent"], padx=10, pady=8)
-        scrollbar = ttk.Scrollbar(log_frame, command=self.log_box.yview)
-        self.log_box.configure(yscrollcommand=scrollbar.set)
+        self.logs_panel = ttk.Frame(outer, style="Surface.TFrame", padding=(22, 8, 22, 16), height=150)
+        self.logs_panel.pack_propagate(False)
+        self.log_box = tk.Text(self.logs_panel, height=5, width=1, state="disabled", wrap="word",
+                               font=("Segoe UI", 9), bg=c["surface"], fg=c["muted"], relief="flat",
+                               borderwidth=0, highlightthickness=0, spacing3=4)
+        scrollbar = ttk.Scrollbar(self.logs_panel, command=self.log_box.yview)
         scrollbar.pack(side="right", fill="y")
+        self.log_box.configure(yscrollcommand=scrollbar.set)
         self.log_box.pack(side="left", fill="both", expand=True)
-        self.notebook.add(log_frame, text="Activity")
-        self.notebook.add(results_frame, text="Results (0)")
-        footer = ttk.Label(outer, text="Keep this app open, your PC awake, internet and sound on.\n"
-                           "Alerts announce results; they don't confirm a pass.",
-                           style="Muted.TLabel", font=("Segoe UI", 9), wraplength=540)
-        footer.pack(side="bottom", anchor="w", fill="x", pady=(10, 0))
-        self.notebook.pack(fill="both", expand=True)
-        outer.bind("<Configure>", lambda event: footer.configure(wraplength=max(1, event.width - 32)))
+        self.log_link_count = 0
+
+        self.refresh_sounds()
         self.refresh_watches()
-        self.log("Select a watch to choose or test its sound. Pause watching to edit the list.")
+        self.log("Ready.")
+        for name, url in SOURCES:
+            self.log(f"Watch source · {name}", url=url)
         if settings_error:
             self.log(settings_error)
-            self.detail.set("Couldn't load saved watches. See Activity; your original file is kept.")
         root.protocol("WM_DELETE_WINDOW", self.close)
         self.pump_job = root.after(200, self.pump)
+        self.eye_job = None
+        self.animate_eye()
 
-    def log(self, message):
+    def save_options(self):
+        try:
+            save_preferences(self.settings_path.parent, self.auto_open.get())
+        except OSError as exc:
+            self.log(f"Couldn't save settings: {exc}")
+
+    def show_notice(self, message):
+        self.notice.set(message)
+        if self.notice_job:
+            self.root.after_cancel(self.notice_job)
+        self.notice_job = self.root.after(5000, lambda: self.notice.set(""))
+
+    def show_view(self, name):
+        for panel in (self.watch_panel, self.sounds_panel, self.settings_panel):
+            panel.pack_forget()
+        self.current_view = name
+        {"watch": self.watch_panel, "sounds": self.sounds_panel,
+         "settings": self.settings_panel}[name].pack(fill="both", expand=True)
+
+    def show_sounds(self):
+        self.refresh_sounds()
+        self.show_view("sounds")
+
+    def show_settings(self):
+        self.show_view("settings")
+
+    def toggle_logs(self):
+        self.logs_open = not self.logs_open
+        if self.logs_open:
+            self.logs_panel.grid(row=5, column=0, sticky="ew")
+            self.root.after_idle(lambda: self.log_box.see("end"))
+        else:
+            self.logs_panel.grid_remove()
+        height = 800 if self.logs_open else 650
+        self.root.minsize(772, height)
+        self.root.maxsize(772, height)
+        self.root.geometry(f"772x{height}")
+        self.logs_button.configure(text="−  Hide logs" if self.logs_open else "＋  Show logs")
+
+    def edit_watch(self):
+        if self.preview:
+            self.stop_preview()
+        index = self.selected_watch_index()
+        if index is not None:
+            self.show_add_dialog(index)
+
+    def show_add_dialog(self, edit_index=None):
+        if self.form_frame.winfo_manager() and edit_index is None:
+            self.form_frame.pack_forget()
+            self.watch_list.configure(height=min(max(1, len(self.watches)) * 67, 270))
+            return
+        self.form_edit_index = edit_index
+        if edit_index is not None:
+            watch = self.watches[edit_index]
+            self.exam.set(watch.target.exam)
+            self.month.set(watch.target.month or "Any month")
+            self.year.set(watch.target.year)
+            self.new_only.set(watch.new_only)
+        else:
+            self.exam.set("")
+            self.new_only.set(False)
+        self.add_button.configure(text="Save" if edit_index is not None else "Add",
+                                  command=lambda: self.add_watch(edit_index=edit_index))
+        self.form_frame.pack(fill="x", after=self.add_link)
+        self.watch_list.configure(height=min(max(1, len(self.watches)) * 67, 140))
+        self.exam_box.focus_set()
+
+    def toggle_form_options(self):
+        if self.new_only_box.winfo_manager():
+            self.new_only_box.pack_forget()
+        else:
+            self.new_only_box.pack(anchor="w", before=self.add_button, pady=(3, 4))
+
+    def show_watch_menu(self, index, widget):
+        import tkinter as tk
+        self.select_watch(index)
+        menu = tk.Menu(widget, tearoff=False, bg=self.colors["surface"],
+                       fg=self.colors["ink"], activebackground=self.colors["selected"])
+        menu.add_command(label="Edit exam", command=self.edit_watch)
+        menu.add_command(label="Remove exam", command=self.remove_watch)
+        menu.tk_popup(widget.winfo_rootx() + 150, widget.winfo_rooty() + 25)
+
+    def select_watch(self, index):
+        if 0 <= index < len(self.watches):
+            self.selection_index = index
+            self.refresh_watches(index)
+
+    def refresh_sounds(self):
+        self.sound_paths = available_sounds(self.settings_path.parent)
+        names = [Path(path).name for path in self.sound_paths]
+        self.sound_names = ["Chime", *[f"{name} · {Path(path).parent.name[:6]}"
+                                        if names.count(name) > 1 else name
+                                        for name, path in zip(names, self.sound_paths)]]
+        self.sound_tree.delete(*self.sound_tree.get_children())
+        self.sound_tree.insert("", "end", iid="default", values=("Chime · built in",))
+        for index, path in enumerate(self.sound_paths):
+            self.sound_tree.insert("", "end", iid=str(index), values=(Path(path).name,))
+        self.sound_box.configure(values=self.sound_names)
+        missing = [watch for watch in self.watches if watch.sound and watch.sound not in self.sound_paths]
+        if missing:
+            watches = [replace(watch, sound="") if watch in missing else watch
+                       for watch in self.watches]
+            if self.store_watches(watches, selection=self.selected_watch_index()):
+                self.show_notice(f"{len(missing)} exam{'s' if len(missing) != 1 else ''} now use Chime.")
+        self.sync_sound_choice()
+
+    def sync_sound_choice(self):
+        index = self.selected_watch_index()
+        if index is None:
+            self.sound_choice.set("Chime")
+            return
+        sound = self.watches[index].sound
+        if sound and sound not in self.sound_paths:
+            watches = self.watches.copy()
+            watches[index] = replace(watches[index], sound="")
+            if self.store_watches(watches, selection=index):
+                self.show_notice(f"{watches[index].target.exam} now uses Chime.")
+                self.log(f"{watches[index].target.exam} now uses Chime; its sound is unavailable.")
+            sound = ""
+        self.sound_choice.set(self.sound_names[self.sound_paths.index(sound) + 1] if sound else "Chime")
+
+    def assign_sound(self, event=None):
+        index = self.selected_watch_index()
+        if index is None:
+            return
+        name = self.sound_choice.get()
+        sound = "" if name == "Chime" else (
+            self.sound_paths[self.sound_names.index(name) - 1] if name in self.sound_names else None)
+        if sound is None:
+            return
+        watches = self.watches.copy()
+        watches[index] = replace(watches[index], sound=sound)
+        self.store_watches(watches, selection=index)
+
+    def add_sound(self):
+        from tkinter import filedialog
+        filename = filedialog.askopenfilename(parent=self.root, title="Add alarm sound",
+                                              filetypes=[("PCM WAV audio", "*.wav")])
+        if not filename:
+            return
+        try:
+            imported = import_sound(Path(filename), self.settings_path.parent)
+        except (OSError, ValueError, wave.Error, EOFError) as exc:
+            self.notify("Couldn't add sound", str(exc), "error")
+            return
+        self.refresh_sounds()
+        self.log(f"Added {Path(imported).name}.")
+
+    def selected_library_sound(self):
+        selection = self.sound_tree.selection()
+        if not selection:
+            return None
+        return "" if selection[0] == "default" else self.sound_paths[int(selection[0])]
+
+    def test_library_sound(self):
+        if self.current_alert or self.preview:
+            return
+        if self.sound_mode == "test" and self.alarm_active:
+            self.stop_sound()
+            return
+        sound = self.selected_library_sound()
+        if sound is None:
+            return
+        self.play(sound)
+        self.sound_mode = "test"
+        self.library_test_button.configure(text="Stop")
+        self.sound_test_job = self.root.after(30000, self.stop_sound)
+
+    def remove_sound(self):
+        from tkinter import messagebox
+        sound = self.selected_library_sound()
+        if not sound:
+            return
+        if not messagebox.askyesno("Remove sound?", f"Remove {Path(sound).name}?", parent=self.root):
+            return
+        if self.preview and self.watches[self.preview[0]].sound == sound:
+            self.stop_preview()
+        if self.sound_mode == "test":
+            self.stop_sound()
+        watches = [replace(watch, sound="") if watch.sound == sound else watch for watch in self.watches]
+        count = sum(watch.sound == sound for watch in self.watches)
+        if count and not self.store_watches(watches, selection=self.selected_watch_index()):
+            return
+        active_sound = (self.current_alert is not None and
+                        self.current_alert.watches[0].sound == sound)
+        was_ringing = active_sound and self.alarm_active
+        if active_sound:
+            self.stop_sound()
+            self.current_alert = Found(self.current_alert.article, tuple(
+                replace(watch, sound="") if watch.sound == sound else watch
+                for watch in self.current_alert.watches))
+        self.pending_alerts = deque(Found(item.article, tuple(
+            replace(watch, sound="") if watch.sound == sound else watch
+            for watch in item.watches)) for item in self.pending_alerts)
+        path = self.settings_path.parent / sound
+        try:
+            path.unlink()
+        except OSError as exc:
+            self.log(f"Couldn't remove sound: {exc}")
+            return
+        try:
+            path.parent.rmdir()
+        except OSError:
+            pass
+        if was_ringing:
+            self.play("")
+            self.sound_mode = "alert"
+        self.refresh_sounds()
+        message = (f"{count} exam{'s' if count != 1 else ''} now use Chime." if count else
+                   f"Removed {path.name}.")
+        self.show_notice(message)
+        self.log(message)
+
+    def preview_alert(self):
+        if self.preview:
+            self.stop_preview()
+            return
+        index = self.selected_watch_index()
+        if index is None or self.current_alert:
+            return
+        self.preview = (index, self.current_view)
+        self.alert_started = time.monotonic()
+        self.show_view("watch")
+        self.show_alert_layout()
+        self.status.set("Results released")
+        self.detail.set("Alert preview · No result has been detected")
+        self.alert_actions.pack(pady=(22, 0))
+        self.result_button.configure(state="disabled")
+        self.silence_button.configure(text="Stop preview")
+        self.silence_button.configure(state="normal")
+        self.test_button.configure(state="disabled")
+        self.play(self.watches[index].sound)
+        self.sound_mode = "preview"
+        self.preview_job = self.root.after(10000, self.stop_preview)
+
+    def stop_preview(self):
+        if not self.preview:
+            return
+        _, previous = self.preview
+        self.preview = None
+        if self.preview_job:
+            self.root.after_cancel(self.preview_job)
+            self.preview_job = None
+        self.stop_sound()
+        self.alert_actions.pack_forget()
+        self.show_monitor_layout()
+        self.show_view(previous)
+        self.update_status()
+        self.update_controls()
+
+    def show_alert_layout(self):
+        self.divider.pack_forget()
+        self.alarm_row.pack_forget()
+        if self.eye.winfo_manager():
+            self.eye.pack_configure(pady=(40, 0))
+        self.back_button.pack(anchor="e", pady=(26, 0))
+
+    def show_monitor_layout(self):
+        self.back_button.pack_forget()
+        if self.eye.winfo_manager():
+            self.eye.pack_configure(pady=(28, 0))
+        self.divider.pack(fill="x", pady=(22, 18))
+        self.alarm_row.pack(fill="x")
+
+    def dismiss_alert(self):
+        if self.preview:
+            self.stop_preview()
+            return
+        self.stop_sound()
+        self.current_alert = None
+        self.match = None
+        self.alert_actions.pack_forget()
+        self.show_monitor_layout()
+        if self.pending_alerts:
+            self.next_alert()
+        else:
+            self.update_status()
+            self.update_controls()
+
+    def animate_eye(self):
+        c = self.eye
+        c.delete("all")
+        state = ("paused" if self.paused.is_set() or self.stop.is_set() else
+                 "alert" if self.current_alert or self.preview else
+                 "paused" if not self.running else
+                 "error" if "error" in self.source_state else "watching")
+        colors = self.colors
+        t = time.monotonic()
+        blink = state == "watching" and (t % 8.0) < .14
+        outline = colors["amber"] if state == "alert" else "#b984e7"
+        # Blend concentric halos into the canvas for a soft glow without image dependencies.
+        base = (23, 21, 30)
+        glow = (231, 181, 104) if state == "alert" else (174, 115, 226)
+        pulse = .8 + .2 * math.sin(t * 1.5)
+        for step in range(20):
+            strength = (step / 19) ** 1.6 * .16 * pulse
+            color = "#" + "".join(f"{round(a + (b - a) * strength):02x}" for a, b in zip(base, glow))
+            c.create_oval(10 + step * 2, 2 + step, 210 - step * 2, 128 - step,
+                          fill=color, outline="", tags="glow")
+        for step in range(10):
+            strength = step / 9 * .22
+            color = "#" + "".join(f"{round(a + (b - a) * strength):02x}" for a, b in zip(base, glow))
+            c.create_oval(62 + step * 2, 125 + step * .4, 158 - step * 2, 140 - step * .4,
+                          fill=color, outline="", tags="glow")
+        if state == "paused" or blink:
+            c.create_polygon(42, 65, 76, 63, 110, 64, 144, 63, 178, 65,
+                             144, 67, 110, 66, 76, 67, fill="#e8d9f5",
+                             outline=outline, width=1, smooth=True, tags="closed_lid")
+        else:
+            c.create_polygon(42, 65, 65, 39, 90, 25, 110, 23, 130, 25, 155, 39,
+                             178, 65, 155, 91, 130, 105, 110, 107, 90, 105, 65, 91,
+                             fill="#f0e5fb", outline=outline, width=3, smooth=True,
+                             splinesteps=24)
+            offset = int(7 * math.sin(t * .6)) if state == "watching" else 0
+            iris = colors["amber"] if state == "alert" else "#ac77d9"
+            if state == "error":
+                iris = "#8b7d9a"
+            c.create_oval(82 + offset, 35, 138 + offset, 95, fill=iris, outline="", tags="iris")
+            c.create_oval(96 + offset, 49, 124 + offset, 80, fill="#342044", outline="")
+            c.create_oval(88 + offset, 41, 100 + offset, 53, fill="#ffffff", outline="")
+        self.eye_job = self.root.after(80, self.animate_eye)
+
+    def log(self, message, url=None):
         self.log_box.configure(state="normal")
         self.log_box.insert("end", f"[{datetime.now():%H:%M:%S}] {message}\n")
+        if url:
+            self.log_link_count += 1
+            tag = f"url_{self.log_link_count}"
+            self.log_box.insert("end", f"    {url}\n", tag)
+            self.log_box.tag_configure(tag, foreground=self.colors["accent"], underline=True)
+            self.log_box.tag_bind(tag, "<Button-1>", lambda event, link=url: self.open_url(link))
+            self.log_box.tag_bind(tag, "<Enter>", lambda event: self.log_box.configure(cursor="hand2"))
+            self.log_box.tag_bind(tag, "<Leave>", lambda event: self.log_box.configure(cursor="xterm"))
         if int(self.log_box.index("end-1c").split(".")[0]) > 300:
             self.log_box.delete("1.0", "40.0")
+            for tag in self.log_box.tag_names():
+                if tag.startswith("url_") and not self.log_box.tag_ranges(tag):
+                    self.log_box.tag_delete(tag)
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
 
@@ -576,38 +974,65 @@ class WatcherApp:
             self.year.set("")
 
     def selected_watch_index(self):
-        selection = self.watch_tree.selection()
-        return int(selection[0]) if selection else None
+        return self.selection_index if self.selection_index is not None and self.selection_index < len(self.watches) else None
 
     def refresh_watches(self, selection=None):
         if selection is None:
             selection = self.selected_watch_index()
-        self.watch_tree.delete(*self.watch_tree.get_children())
+        self.selection_index = min(selection or 0, len(self.watches) - 1) if self.watches else None
+        for child in self.watch_cards.winfo_children():
+            child.destroy()
         for index, watch in enumerate(self.watches):
-            count = self.found_counts.get(watch.target, 0)
-            state = f"{count} found" if count else ("New only" if watch.new_only else "Existing + new")
-            self.watch_tree.insert("", "end", iid=str(index), values=(
-                watch.target.exam, watch.target.period, Path(watch.sound).name if watch.sound else "Default", state))
-        if self.watches:
-            selection = min(selection or 0, len(self.watches) - 1)
-            self.watch_tree.selection_set(str(selection))
-            self.watch_tree.see(str(selection))
+            selected = index == self.selection_index
+            card = tk.Canvas(self.watch_cards, width=188, height=62,
+                             bg=self.colors["surface"], highlightthickness=0,
+                             cursor="hand2")
+            card.pack(fill="x", pady=(0, 5))
+            if selected:
+                fill = self.colors["selected"]
+                card.create_rectangle(8, 0, 180, 62, fill=fill, outline="")
+                card.create_rectangle(0, 8, 188, 54, fill=fill, outline="")
+                for x in (0, 172):
+                    for y in (0, 46):
+                        card.create_oval(x, y, x + 16, y + 16, fill=fill, outline="")
+            name = watch.target.exam
+            if len(name) > 24:
+                name = name[:21] + "…"
+            card.create_text(14, 20, text=name, fill=self.colors["ink"],
+                             font=("Segoe UI", 9, "bold"), anchor="w")
+            card.create_text(14, 41, text=watch.target.period, fill=self.colors["muted"],
+                             font=("Segoe UI", 8), anchor="w")
+            if selected:
+                card.create_text(173, 16, text="⋯", fill=self.colors["muted"],
+                                 font=("Segoe UI", 10), anchor="center")
+            card.bind("<Button-1>", lambda event, row=index, item=card:
+                      self.show_watch_menu(row, item) if row == self.selection_index and event.x > 155
+                      else self.select_watch(row))
+            card.bind("<MouseWheel>", lambda event: self.watch_list.yview_scroll(
+                -1 if event.delta > 0 else 1, "units"))
+        limit = 140 if self.form_frame.winfo_manager() else 270
+        self.watch_list.configure(height=min(max(1, len(self.watches)) * 67, limit))
         self.update_controls()
 
     def update_controls(self):
-        selected = self.selected_watch_index() is not None
-        for control in self.edit_controls:
-            control.configure(state="disabled" if self.running else "normal")
-        if not self.running:
-            self.month_box.configure(state="readonly")
-        for control in (self.sound_button, self.default_button, self.remove_button):
-            control.configure(state="normal" if selected and not self.running else "disabled")
-        self.test_button.configure(state="normal" if selected or self.current_alert else "disabled",
-                                   text="Replay alert" if self.current_alert else "Test (30s)")
-        self.result_button.configure(state="normal" if self.match else "disabled")
+        index = self.selected_watch_index()
+        selected = index is not None
+        self.test_button.configure(state="normal" if selected and not (self.current_alert or self.preview)
+                                   else "disabled")
+        self.sound_box.configure(state="readonly" if selected else "disabled")
+        display_watch = self.current_alert.watches[0] if self.current_alert else (
+            self.watches[index] if selected else None)
+        self.watch_name.set(display_watch.target.exam if display_watch else "No exams yet")
+        self.watch_period.set(display_watch.target.period if display_watch else "Add an exam to begin")
+        self.sync_sound_choice()
+        self.result_button.configure(state="normal" if self.current_alert and not self.preview else "disabled")
         count = len(self.pending_alerts)
         self.next_button.configure(state="normal" if count else "disabled",
                                    text=f"Next alert ({count})" if count else "Next alert")
+        if count and not self.next_button.winfo_manager():
+            self.next_button.pack(side="left", padx=4)
+        elif not count and self.next_button.winfo_manager():
+            self.next_button.pack_forget()
         self.start_button.configure(state="normal" if (
             self.running and not self.stop.is_set()) or (not self.running and self.watches) else "disabled")
 
@@ -629,33 +1054,40 @@ class WatcherApp:
             return False
         self.watches = watches
         self.refresh_watches(selection)
-        self.detail.set(f"{len(watches)} watch{'es' if len(watches) != 1 else ''} saved."
-                        if watches else "Add an exam to start watching.")
         return True
 
-    def add_watch(self):
-        if self.running:
-            return
+    def add_watch(self, dialog=None, edit_index=None):
         target = Target("" if self.month.get() == "Any month" else self.month.get(),
                         self.year.get().strip(), self.exam.get().strip())
         try:
             target.validate()
-            if any(watch.target == target for watch in self.watches):
+            if any(index != edit_index and watch.target == target
+                   for index, watch in enumerate(self.watches)):
                 raise ValueError("That exam and date are already in your watch list.")
-            if len(self.watches) >= 100:
+            if edit_index is None and len(self.watches) >= 100:
                 raise ValueError("Your list is full. Remove a watch before adding another.")
         except ValueError as exc:
             self.notify("Check your watch", str(exc), "warning")
             return
-        if self.store_watches([*self.watches, Watch(target, new_only=self.new_only.get())],
-                              selection=len(self.watches)):
-            self.notify("Watch added", f"{target.exam} · {target.period}\n\n"
-                        "Saved to your list. Click Start watching when you're ready.")
+        watches = self.watches.copy()
+        if edit_index is None:
+            watches.append(Watch(target, new_only=self.new_only.get()))
+        else:
+            watches[edit_index] = Watch(target, watches[edit_index].sound, self.new_only.get())
+        if self.store_watches(watches, selection=len(watches) - 1 if edit_index is None else edit_index):
+            if dialog:
+                dialog.destroy()
+            self.form_frame.pack_forget()
+            self.watch_list.configure(height=min(max(1, len(self.watches)) * 67, 270))
+            self.show_view("watch")
+            self.log(f"{'Added' if edit_index is None else 'Updated'} {target.exam} · {target.period}.")
 
     def remove_watch(self):
         from tkinter import messagebox
+        if self.preview:
+            self.stop_preview()
         index = self.selected_watch_index()
-        if self.running or index is None:
+        if index is None:
             return
         target = self.watches[index].target
         if not messagebox.askyesno("Remove watch?",
@@ -666,124 +1098,96 @@ class WatcherApp:
             self.notify("Watch removed", f"{target.exam} was removed from your watch list.")
 
     def choose_sound(self):
-        from tkinter import filedialog
-        index = self.selected_watch_index()
-        if self.running or index is None:
-            return
-        filename = filedialog.askopenfilename(parent=self.root, title="Choose this exam's alarm",
-                                              filetypes=[("WAV audio", "*.wav")])
-        if not filename:
-            return
-        try:
-            sound = import_sound(Path(filename), self.settings_path.parent)
-        except (OSError, ValueError, wave.Error, EOFError) as exc:
-            self.log(f"Couldn't read sound: {exc}")
-            self.notify("Couldn't save sound", "Choose a readable PCM WAV file and make sure "
-                        "there's space to save it. Your previous sound is unchanged.", "error")
-            return
-        watches = self.watches.copy()
-        watches[index] = replace(watches[index], sound=sound)
-        if self.store_watches(watches, selection=index):
-            self.notify("Sound saved", f"{Path(filename).name}\nFor {watches[index].target.exam}\n\n"
-                        "A copy is saved in the app. Click Test (30s) to hear it.")
+        self.show_sounds()
 
     def use_default_sound(self):
         index = self.selected_watch_index()
-        if self.running or index is None:
+        if index is None:
             return
         watches = self.watches.copy()
         watches[index] = replace(watches[index], sound="")
         if self.store_watches(watches, selection=index):
-            self.notify("Default sound restored", f"{watches[index].target.exam} will use the default alarm.")
+            self.log(f"{watches[index].target.exam} now uses Chime.")
 
     def start(self):
         if self.running or not self.watches:
             return
         self.silence()
+        self.current_alert = None
         self.match = None
+        self.alert_actions.pack_forget()
+        self.show_monitor_layout()
         self.pending_alerts.clear()
-        self.found_counts.clear()
         self.stop = threading.Event()
+        self.paused.clear()
         self.events = queue.Queue()
         self.source_state = ["idle"] * len(SOURCES)
-        self.next_checks = [0.0] * len(SOURCES)
         self.running = True
-        self.start_button.configure(text="Stop watching", command=self.stop_watching)
+        self.started_once = True
+        self.start_button.configure(text="Ⅱ  Pause", command=self.pause_watching)
         self.refresh_watches()
-        self.status.set("Watching for results")
-        self.detail.set(f"{len(self.watches)} watches · checking PRC's announcement pages.")
-        for index in range(len(SOURCES)):
-            self.source_labels[index].set("Waiting to check")
-            self.source_widgets[index].configure(style="Muted.TLabel")
+        self.status.set("Watching")
+        self.detail.set("Checking PRC…")
         self.log(f"Watching {len(self.watches)} exams/date filters. New-only watches skip each source's first successful check.")
-        self.worker = threading.Thread(target=monitor, args=(list(self.watches), self.stop, self.events), daemon=True)
+        self.worker = threading.Thread(target=monitor, args=(list(self.watches), self.stop, self.events),
+                                       kwargs={"pause": self.paused,
+                                               "get_watches": lambda: self.watches.copy()}, daemon=True)
         self.worker.start()
 
-    def stop_watching(self):
-        self.stop.set()
-        self.start_button.configure(text="Stopping...", state="disabled")
-        self.status.set("Finishing this check")
-        self.detail.set("Waiting for the current request to finish.")
-        self.log("Stop requested.")
+    def pause_watching(self):
+        if not self.running:
+            return
+        self.paused.set()
+        self.start_button.configure(text="▶  Resume", command=self.resume_watching)
+        self.log("Monitoring paused.")
+        self.update_status()
+
+    def resume_watching(self):
+        if not self.running:
+            return
+        self.paused.clear()
+        self.start_button.configure(text="Ⅱ  Pause", command=self.pause_watching)
+        self.log("Monitoring resumed.")
+        self.update_status()
 
     def update_status(self):
-        if self.current_alert or (self.running and self.stop.is_set()):
+        if self.current_alert or self.preview:
+            return
+        if self.paused.is_set() or not self.running:
+            self.status.set("Paused" if self.started_once else "Ready")
+            self.detail.set("")
             return
         errors = self.source_state.count("error")
-        if errors == len(SOURCES):
-            self.status.set("Couldn't reach PRC")
-            self.detail.set("Result status unknown. Retrying automatically.")
-        elif errors:
-            self.status.set("Watching one source")
-            self.detail.set("The other source is unavailable. Retrying automatically.")
-        elif "ok" in self.source_state:
-            self.status.set("Watching for results")
-            self.detail.set("Checking for more announcements.")
-        if not self.running and not errors:
-            self.status.set("Watching paused")
-            self.detail.set("Start watching whenever you're ready.")
+        self.status.set("Reconnecting" if errors else "Watching")
+        self.detail.set(f"Checked {self.last_checked:%I:%M %p} · every 2 min" if self.last_checked
+                        else "Checking PRC…")
 
     def pump(self):
         try:
             while True:
                 event, index, payload = self.events.get_nowait()
                 if event == "checking":
-                    self.source_labels[index].set("Checking...")
-                    self.source_widgets[index].configure(style="Muted.TLabel")
+                    self.log(f"{SOURCES[index][0]}: checking.", url=SOURCES[index][1])
                 elif event == "ok":
                     self.source_state[index] = "ok"
-                    self.next_checks[index] = payload
-                    self.source_labels[index].set(f"Checked · {datetime.now():%H:%M:%S}")
-                    self.source_widgets[index].configure(style="Muted.TLabel")
+                    self.last_checked = datetime.now()
                     self.log(f"{SOURCES[index][0]}: checked.")
                     self.update_status()
                 elif event == "error":
                     message, due = payload
                     self.source_state[index] = "error"
-                    self.next_checks[index] = due
-                    self.source_labels[index].set("Unavailable · retrying")
-                    self.source_widgets[index].configure(style="Error.TLabel")
                     self.log(f"{SOURCES[index][0]}: {message} Retry in {math.ceil(due-time.monotonic())} seconds.")
                     self.update_status()
                 elif event == "found":
-                    self.source_labels[index].set("Announcement found")
-                    self.source_widgets[index].configure(style="TLabel")
                     self.show_match(payload)
                 elif event == "done":
                     self.running = False
-                    self.start_button.configure(text="Start watching", command=self.start)
+                    self.start_button.configure(text="▶  Start", command=self.start)
                     self.update_controls()
                     if not self.current_alert:
-                        self.status.set("Watching paused")
-                        self.detail.set("Your results are kept below. Start again when you're ready.")
+                        self.update_status()
         except queue.Empty:
             pass
-        if self.running and not self.stop.is_set():
-            due = min(self.next_checks)
-            seconds = max(0, math.ceil(due-time.monotonic()))
-            self.countdown.set(f"Next check in {seconds // 60}:{seconds % 60:02d}" if seconds else "Checking PRC...")
-        else:
-            self.countdown.set("Checks every 2 minutes")
         self.pump_job = self.root.after(200, self.pump)
 
     def default_melody(self):
@@ -834,43 +1238,47 @@ class WatcherApp:
             if job:
                 self.root.after_cancel(job)
         self.alarm_job = self.sound_test_job = None
+        self.sound_mode = None
+        self.library_test_button.configure(text="Test")
+        self.test_button.configure(text="Test")
         if sys.platform == "win32":
             import winsound
             try:
                 winsound.PlaySound(None, 0)
             except RuntimeError:
                 pass
-        self.silence_button.configure(state="disabled")
 
     def silence(self):
+        if self.preview:
+            self.stop_preview()
+            return
         self.stop_sound()
-        self.current_alert = None
+        self.silence_button.configure(state="disabled")
         self.update_controls()
         self.update_status()
 
     def test_alarm(self):
-        # A test must never replace or automatically silence a real result alarm.
         if self.current_alert:
-            self.play(self.current_alert.watches[0].sound)
-            self.log("Replaying the announcement alarm. Click Silence alarm to stop.")
-        else:
-            index = self.selected_watch_index()
-            if index is None:
-                return
-            self.play(self.watches[index].sound)
-            self.sound_test_job = self.root.after(30000, self.silence)
-            self.log("Sound test · stops after 30 seconds.")
+            return
+        if self.sound_mode == "test" and self.alarm_active:
+            self.stop_sound()
+            return
+        index = self.selected_watch_index()
+        if index is None:
+            return
+        self.play(self.watches[index].sound)
+        self.sound_mode = "test"
+        self.test_button.configure(text="Stop")
+        self.sound_test_job = self.root.after(30000, self.stop_sound)
 
     def show_match(self, found):
+        if self.preview:
+            self.stop_preview()
+        latest = {watch.target: watch for watch in self.watches}
+        found = Found(found.article, tuple(latest.get(watch.target, watch) for watch in found.watches))
         self.results.append(found)
-        self.result_tree.insert("", "end", iid=str(len(self.results) - 1),
-                                values=(found.watches[0].target.exam, found.article.title))
-        self.notebook.tab(1, text=f"Results ({len(self.results)})")
-        for watch in found.watches:
-            self.found_counts[watch.target] = self.found_counts.get(watch.target, 0) + 1
         self.pending_alerts.append(found)
-        self.log(found.article.title)
-        self.log(found.article.url)
+        self.log(f"RESULT · {found.article.title}", url=found.article.url)
         self.refresh_watches()
         if self.current_alert is None:
             self.next_alert()
@@ -879,11 +1287,20 @@ class WatcherApp:
         if not self.pending_alerts:
             return
         self.current_alert = self.pending_alerts.popleft()
+        self.alert_started = time.monotonic()
         self.match = self.current_alert.article
-        self.status.set("Announcement found")
-        title = self.match.title
-        self.detail.set(title if len(title) <= 120 else title[:117].rstrip() + "...")
-        self.notebook.select(1)
+        self.status.set("Results released")
+        alert_watch = self.current_alert.watches[0]
+        self.detail.set("prc.gov.ph")
+        self.alert_actions.pack(pady=(22, 0))
+        self.silence_button.configure(text="Silence")
+        self.silence_button.configure(state="normal")
+        self.show_view("watch")
+        self.show_alert_layout()
+        for index, watch in enumerate(self.watches):
+            if watch.target == alert_watch.target:
+                self.select_watch(index)
+                break
         self.update_controls()
         self.root.deiconify()
         self.root.lift()
@@ -892,13 +1309,9 @@ class WatcherApp:
             self.root.after_cancel(self.topmost_job)
         self.topmost_job = self.root.after(1200, lambda: self.root.attributes("-topmost", False))
         self.play(self.current_alert.watches[0].sound)
+        self.sound_mode = "alert"
         if self.auto_open.get():
             self.open_url(self.match.url)
-
-    def open_selected_result(self, event=None):
-        selection = self.result_tree.selection()
-        if selection:
-            self.open_url(self.results[int(selection[0])].article.url)
 
     def open_url(self, url):
         try:
@@ -914,7 +1327,7 @@ class WatcherApp:
     def close(self):
         self.stop.set()
         self.silence()
-        for job in (self.pump_job, self.topmost_job):
+        for job in (self.pump_job, self.topmost_job, self.eye_job, self.preview_job, self.notice_job):
             if job:
                 self.root.after_cancel(job)
         self.tempdir.cleanup()
