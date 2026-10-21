@@ -18,6 +18,21 @@ RESULT_PAGE = (
 
 
 class PageTests(unittest.TestCase):
+    def test_pharmacists_release_is_found_in_common_prc_link_formats(self):
+        title = ("October 2026 Pharmacists Licensure Examination Results "
+                 "Released in Two (2) Working Days")
+        for link in (
+            f'<a href="/article/october-2026-pharmacists-results">{title}</a>',
+            f'<a href="/node/9999" title="{title}">Read more</a>',
+            f'<a href="/node/9999"><img src="/result.png" alt="{title}"></a>',
+            '<a href="/article/october-2026-pharmacists-licensure-examination-results-'
+            'released-two-2-working-days">Read more</a>',
+        ):
+            with self.subTest(link=link):
+                page = "<h1>Professional Regulation Commission</h1>" + link
+                found = alarm.inspect_page(page, BASE, alarm.Target())
+                self.assertEqual(len(found), 1)
+
     def test_malformed_link_does_not_hide_a_valid_result(self):
         page = '<a href="https://[broken/article/result">Broken link</a>' + RESULT_PAGE
 
@@ -125,6 +140,67 @@ class RetryTests(unittest.TestCase):
 
 
 class MonitorTests(unittest.TestCase):
+    def test_pharmacists_result_added_after_baseline_rings_once_with_selected_sound(self):
+        for new_only in (False, True):
+            with self.subTest(new_only=new_only):
+                stop = threading.Event()
+                events = queue.Queue()
+                rounds = 0
+                watch = alarm.Watch(sound="pharmacy.wav", new_only=new_only)
+                baseline = ("<h1>Professional Regulation Commission</h1>"
+                            '<a href="/article/office-advisory">Office advisory</a>')
+
+                def wait(timeout):
+                    nonlocal rounds
+                    rounds += 1
+                    if rounds == 3:
+                        stop.set()
+
+                def fetch(url):
+                    return baseline + (RESULT_PAGE if rounds else "")
+
+                stop.wait = wait
+                with patch.object(alarm, "INTERVAL", 0):
+                    alarm.monitor([watch], stop, events, fetch=fetch)
+                found = [payload for kind, _, payload in events.queue if kind == "found"]
+                self.assertEqual(len(found), 1)
+                self.assertEqual(found[0].article.url, RESULT_URL)
+                self.assertEqual(found[0].watches, (watch,))
+                self.assertEqual(sum(kind == "ok" for kind, _, _ in events.queue), 6)
+
+    def test_both_sources_recover_and_find_result_after_network_failure(self):
+        stop = threading.Event()
+        events = queue.Queue()
+        rounds = 0
+
+        def wait(timeout):
+            nonlocal rounds
+            rounds += 1
+            if rounds == 3:
+                stop.set()
+
+        def fetch(url):
+            if rounds == 0:
+                raise alarm.CheckError("Connection failed")
+            return RESULT_PAGE
+
+        stop.wait = wait
+        with patch.object(alarm, "INTERVAL", 0):
+            alarm.monitor([alarm.Watch()], stop, events, fetch=fetch)
+        self.assertEqual(sum(kind == "error" for kind, _, _ in events.queue), 2)
+        self.assertEqual(sum(kind == "ok" for kind, _, _ in events.queue), 4)
+        self.assertEqual(sum(kind == "found" for kind, _, _ in events.queue), 1)
+
+    def test_duplicate_result_across_www_index_php_and_node_aliases_rings_once(self):
+        stop = threading.Event()
+        events = queue.Queue()
+        stop.wait = lambda timeout: stop.set()
+        page = RESULT_PAGE + RESULT_PAGE.replace(
+            RESULT_URL, "https://www.prc.gov.ph/index.php/article/october-2026-pharmacists-results/")
+        page += RESULT_PAGE.replace(RESULT_URL, "/node/9999")
+        alarm.monitor([alarm.Watch()], stop, events, fetch=lambda url: page)
+        self.assertEqual(sum(kind == "found" for kind, _, _ in events.queue), 1)
+
     def test_pause_during_request_defers_result_until_resume(self):
         events = queue.Queue()
         stop, pause = threading.Event(), threading.Event()

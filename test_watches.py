@@ -8,6 +8,27 @@ from watches import ALL_EXAMS, Target, Watch, load_watches, save_watches
 
 
 class TargetTests(unittest.TestCase):
+    def test_october_2026_pharmacists_release_titles_and_unrelated_notices(self):
+        target = Target()
+        for title in (
+            "October 2026 Pharmacists Licensure Examination Results Released in Two (2) Working Days",
+            "October 2026 Pharmacist Licensure Examination Results",
+            "October 2026 Pharmacy Board Examination Results",
+            "October 2026 PhLE Results",
+        ):
+            with self.subTest(title=title):
+                self.assertTrue(target.matches(title))
+        for title in (
+            "October 2025 Pharmacists Licensure Examination Results",
+            "November 2026 Pharmacists Licensure Examination Results",
+            "October 2026 Nurses Licensure Examination Results",
+            "October 2026 Pharmacists Licensure Examination Results Release Date",
+            "October 2026 Pharmacists Licensure Examination Results Not Yet Released",
+            "October 2026 Pharmacists Licensure Examination Room Assignment",
+        ):
+            with self.subTest(title=title):
+                self.assertFalse(target.matches(title))
+
     def test_other_boards_and_aliases_match(self):
         for exam, title in (
             ("Nurses", "Nurses"), ("Nurses", "Nursing"),

@@ -2,6 +2,7 @@
 
 import sys
 import tempfile
+import time
 from pathlib import Path
 import tkinter as tk
 import unittest
@@ -143,6 +144,84 @@ class WatcherUITests(unittest.TestCase):
         self.assertFalse(self.app.alarm_active)
         self.assertIn("disabled", self.app.silence_button.state())
         self.assertEqual(self.app.status.get(), "Results released")
+
+    def test_offline_monitor_reaches_gui_and_loops_until_silenced(self):
+        import winsound
+        html = ('<html><h1>Professional Regulation Commission</h1><a href="/node/123">'
+                'October 2026 Pharmacists Licensure Examination Results</a></html>')
+        monitor = prc_result_alarm.monitor
+        self.app.auto_open.set(True)
+        with patch("prc_result_alarm.monitor", side_effect=lambda *args, **kwargs:
+                   monitor(*args, fetch=lambda url: html, **kwargs)), \
+                patch("winsound.PlaySound") as audio, \
+                patch("prc_result_alarm.webbrowser.open", return_value=True) as browser, \
+                patch.object(self.root, "deiconify"), patch.object(self.root, "lift"), \
+                patch.object(self.root, "attributes"):
+            self.app.start_button.invoke()
+            try:
+                self.app.pump()
+                deadline = time.monotonic() + 3
+                while self.app.source_state != ["ok", "ok"] and time.monotonic() < deadline:
+                    self.root.update()
+                    time.sleep(.01)
+                self.assertEqual(self.app.source_state, ["ok", "ok"])
+                self.assertEqual(len(self.app.results), 1)
+                self.assertEqual(self.app.status.get(), "Results released")
+                self.assertEqual(self.app.sound_mode, "alert")
+                self.assertTrue(self.app.alarm_active)
+                filename, flags = audio.call_args.args
+                self.assertTrue(Path(filename).is_file())
+                self.assertEqual(flags, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_LOOP)
+                browser.assert_called_once_with(self.app.match.url, new=2)
+                self.assertIsNone(self.app.sound_test_job)
+                self.app.result_button.invoke()
+                self.assertEqual(browser.call_count, 2)
+                self.app.silence_button.invoke()
+                audio.assert_called_with(None, 0)
+                self.assertFalse(self.app.alarm_active)
+                self.assertEqual(self.app.status.get(), "Results released")
+            finally:
+                self.app.stop.set()
+                self.app.worker.join(timeout=2)
+            self.assertFalse(self.app.worker.is_alive())
+
+    def test_windows_audio_failure_retries_chime_then_repeating_system_bell(self):
+        with patch("winsound.PlaySound", side_effect=RuntimeError("Device unavailable")) as audio:
+            self.app.play()
+            self.assertEqual(audio.call_count, 3)  # Stop, requested sound, then Chime.
+            self.root.bell.assert_called_once()
+            timer = self.app.alarm_job
+            self.assertIn(timer, self.root.tk.call("after", "info"))
+            self.assertTrue(self.app.alarm_active)
+            self.app.silence()
+            self.assertNotIn(timer, self.root.tk.call("after", "info"))
+            self.assertFalse(self.app.alarm_active)
+        self.assertIn("Windows audio unavailable", self.app.log_box.get("1.0", "end"))
+
+    def test_preview_timer_is_removed_before_real_alarm_begins(self):
+        self.app.preview_alert()
+        timer = self.app.preview_job
+        with patch.object(self.root, "deiconify"), patch.object(self.root, "lift"), \
+                patch.object(self.root, "attributes"):
+            self.app.show_match(Found(Article("Result", "https://prc.gov.ph/node/123"), (Watch(),)))
+        self.assertIsNone(self.app.preview_job)
+        self.assertNotIn(timer, self.root.tk.call("after", "info"))
+        self.assertTrue(self.app.alarm_active)
+        self.assertEqual(self.app.sound_mode, "alert")
+        self.app.stop_preview()
+        self.assertTrue(self.app.alarm_active)
+
+    def test_browser_failure_keeps_alert_and_copyable_result_link(self):
+        found = Found(Article("Result", "https://prc.gov.ph/node/123"), (Watch(),))
+        self.app.auto_open.set(True)
+        with patch("prc_result_alarm.webbrowser.open", side_effect=OSError("No browser")), \
+                patch.object(self.root, "deiconify"), patch.object(self.root, "lift"), \
+                patch.object(self.root, "attributes"):
+            self.app.show_match(found)
+            self.app.result_button.invoke()
+        self.assertTrue(self.app.alarm_active)
+        self.assertEqual(self.app.match, found.article)
+        self.assertIn(f"Copy this address: {found.article.url}", self.app.log_box.get("1.0", "end"))
 
     def test_logs_keep_eye_and_toggle_in_place_and_window_compact(self):
         self.root.deiconify()
@@ -428,6 +507,29 @@ class WatcherUITests(unittest.TestCase):
         self.root.withdraw()
         self.app = WatcherApp(self.root, settings_path=Path(self.preferences.name) / "watchlist.json")
         self.assertTrue(self.app.auto_open.get())
+
+    def test_custom_sound_and_watch_survive_close_restart_without_original(self):
+        source = Path(self.preferences.name) / "nurses.wav"
+        prc_result_alarm.create_alarm(source)
+        imported = prc_result_alarm.import_sound(source, self.app.settings_path.parent)
+        saved = [Watch(Target("October", "2026", "Nurses"), imported, True)]
+        self.app.refresh_sounds()
+        self.app.store_watches(saved)
+        source.unlink()
+        settings_path = self.app.settings_path
+        temporary_audio = Path(self.app.tempdir.name)
+        self.app.preview_alert()
+        self.app.close()
+        self.assertTrue(self.app.stop.is_set())
+        self.assertFalse(temporary_audio.exists())
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.app = WatcherApp(self.root, settings_path=settings_path)
+        self.assertEqual(self.app.watches, saved)
+        self.assertEqual(self.app.sound_choice.get(), "nurses.wav")
+        with patch("winsound.PlaySound") as audio:
+            self.app.test_alarm()
+        self.assertEqual(Path(audio.call_args.args[0]), settings_path.parent / imported)
 
     def test_empty_watch_list_cannot_start_and_edits_wait_for_worker(self):
         self.app.running = True
