@@ -1,0 +1,13 @@
+[tool.ruff]
+target-version = "py310"
+extend-exclude = [".venv-build"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["prc_result_alarm.py", "app_files.py", "watches.py"]
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true

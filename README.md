@@ -8,13 +8,15 @@ Get sound alerts for PRC board exam results. Follow the exams you're waiting for
 
 Open the file on Windows 10 or 11 (64-bit). You don't need an installer or Python.
 
-The latest published download is **v1.0.0**, which uses the older interface. The instructions below describe the updated source on `main`; build it locally to use the new interface.
+Version **1.1.0** includes the redesigned interface and fixes for pausing and alarm-sound removal. Close the old app before replacing it. Your saved watches and sounds stay on your PC.
 
 ## Getting started
 
 1. Click **Add exam**, pick an exam and month/year, then **Add**. Use the selected watch's **⋯** menu to edit or remove it.
 2. Select a watch and choose its sound from the **Alarm** dropdown. **Test** plays it for up to 30 seconds; **Stop** ends the test sooner.
 3. Click **Start**. **Pause** and **Resume** keep the current monitoring session and its duplicate detection.
+
+If you pause during a check, any result it finds waits until you resume. An alarm that was already ringing stays active until you click **Silence**.
 
 Keep the app open, your PC awake, and internet and sound on. Minimizing is fine. Checks run about every two minutes, with slower retries after connection errors.
 
@@ -65,5 +67,17 @@ py -3 -m unittest -q
 ```
 
 To build the executable, run `.\build_exe.cmd` on Windows. It installs the build tools in a local virtual environment, runs the tests, and creates `dist\PRCResultAlarm.exe`.
+
+For development checks, install the tools in a virtual environment:
+
+```bat
+py -3 -m venv .venv
+.venv\Scripts\python -m pip install -r requirements-dev.txt
+.venv\Scripts\python -m ruff check .
+.venv\Scripts\python -m mypy
+.venv\Scripts\python -m unittest -q
+```
+
+GitHub Actions runs linting, type checks, and offline tests on Windows with Python 3.10 and 3.14 for pushes to `main` and pull requests. A passing run builds the executable and publishes it with a SHA256 checksum as a workflow artifact. These development tools are not required to run the app.
 
 The app checks public announcements on [PRC's results page](https://prc.gov.ph/articles/exam-results) and [homepage](https://www.prc.gov.ph/). It doesn't search the full archive or check individual scores. Delays, outages, or changes to those pages can cause it to miss a result.

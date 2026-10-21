@@ -125,6 +125,49 @@ class RetryTests(unittest.TestCase):
 
 
 class MonitorTests(unittest.TestCase):
+    def test_pause_during_request_defers_result_until_resume(self):
+        events = queue.Queue()
+        stop, pause = threading.Event(), threading.Event()
+        found_while_paused = []
+        calls = []
+
+        def fetch(url):
+            calls.append(url)
+            if len(calls) == 1:
+                pause.set()
+            return RESULT_PAGE
+
+        def wait(timeout):
+            if pause.is_set():
+                found_while_paused.append(sum(kind == "found" for kind, _, _ in events.queue))
+                pause.clear()
+                return False
+            stop.set()
+            return True
+
+        stop.wait = wait
+        alarm.monitor([alarm.Watch()], stop, events, fetch=fetch, pause=pause)
+        self.assertEqual(found_while_paused, [0])
+        self.assertEqual(sum(kind == "found" for kind, _, _ in events.queue), 1)
+        self.assertEqual(len(calls), 2)
+
+    def test_stop_while_paused_after_request_discards_result(self):
+        events = queue.Queue()
+        stop, pause = threading.Event(), threading.Event()
+
+        def fetch(url):
+            pause.set()
+            return RESULT_PAGE
+
+        def wait(timeout):
+            stop.set()
+            return True
+
+        stop.wait = wait
+        alarm.monitor([alarm.Watch()], stop, events, fetch=fetch, pause=pause)
+        self.assertFalse(any(kind == "found" for kind, _, _ in events.queue))
+        self.assertEqual(list(events.queue)[-1][0], "done")
+
     def test_second_source_can_find_result_when_first_source_fails(self):
         events = queue.Queue()
 

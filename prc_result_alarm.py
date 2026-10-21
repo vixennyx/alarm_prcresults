@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
+from typing import Any
 from app_files import (available_sounds, data_directory, import_sound, load_preferences,
                        migrate_settings, save_preferences, validate_sound)
 from watches import ALL_EXAMS, EXAMS, EXCLUDED_NOTICE, Target, Watch, load_watches, normalize, save_watches
@@ -191,7 +192,7 @@ def fetch_page(url: str) -> str:
     if not official_url(url):
         raise CheckError("Only official PRC HTTPS pages are supported.")
     request = urllib.request.Request(url, headers={
-        "User-Agent": "PRCResultAlarm/1.0 (personal exam-result notification)",
+        "User-Agent": "PRCResultAlarm/1.1.0 (personal exam-result notification)",
         "Accept": "text/html,application/xhtml+xml",
         "Cache-Control": "no-cache, max-age=0",
     })
@@ -235,9 +236,9 @@ def monitor(watches: list[Watch], stop: threading.Event, events: queue.Queue, fe
             pause: threading.Event | None = None, get_watches=None):
     due = [0.0] * len(SOURCES)
     failures = [0] * len(SOURCES)
-    initialized = set()
-    seen = {}
-    announced = set()
+    initialized: set[tuple[Target, int]] = set()
+    seen: dict[Target, set[str]] = {}
+    announced: set[str] = set()
     try:
         while (get_watches() if get_watches else watches) and not stop.is_set():
             while pause is not None and pause.is_set():
@@ -253,6 +254,10 @@ def monitor(watches: list[Watch], stop: threading.Event, events: queue.Queue, fe
                 events.put(("checking", index, None))
                 try:
                     articles = inspect_page(fetch(url), url)
+                    # A request can finish after Pause was clicked. Keep its result for Resume.
+                    while pause is not None and pause.is_set():
+                        if stop.wait(.2):
+                            return
                     active_watches = get_watches() if get_watches else watches
                     if stop.is_set():
                         return
@@ -313,16 +318,16 @@ class WatcherApp:
         from tkinter import ttk
 
         self.root = root
-        self.events = queue.Queue()
+        self.events: queue.Queue[tuple[str, int, Any]] = queue.Queue()
         self.stop = threading.Event()
         self.paused = threading.Event()
-        self.worker = None
+        self.worker: threading.Thread | None = None
         self.running = False
         self.started_once = False
-        self.match = None
-        self.current_alert = None
-        self.pending_alerts = deque()
-        self.results = []
+        self.match: Article | None = None
+        self.current_alert: Found | None = None
+        self.pending_alerts: deque[Found] = deque()
+        self.results: list[Found] = []
         self.settings_path = settings_path or data_directory() / "watchlist.json"
         settings_error = ""
         try:
@@ -339,10 +344,10 @@ class WatcherApp:
         self.topmost_job = None
         self.alarm_active = False
         self.source_state = ["idle", "idle"]
-        self.last_checked = None
-        self.preview = None
+        self.last_checked: datetime | None = None
+        self.preview: tuple[int, str] | None = None
         self.preview_job = None
-        self.sound_mode = None
+        self.sound_mode: str | None = None
         self.notice_job = None
         self.current_view = "watch"
         self.logs_open = False
@@ -441,7 +446,7 @@ class WatcherApp:
         bell.pack(side="left", padx=(0, 10))
         bell.create_arc(10, 8, 22, 23, start=0, extent=180, style="arc",
                         outline=c["accent"], width=1)
-        bell.create_line(10, 18, 8, 22, 24, 22, 22, 18, fill=c["accent"], smooth=True)
+        bell.create_line([10, 18, 8, 22, 24, 22, 22, 18], fill=c["accent"], smooth=True)
         bell.create_oval(15, 24, 17, 26, fill=c["accent"], outline="")
         ttk.Label(header, text="PRC Result Alarm", style="Surface.TLabel",
                   font=("Segoe UI", 11, "bold")).pack(side="left")
@@ -800,10 +805,9 @@ class WatcherApp:
         count = sum(watch.sound == sound for watch in self.watches)
         if count and not self.store_watches(watches, selection=self.selected_watch_index()):
             return
-        active_sound = (self.current_alert is not None and
-                        self.current_alert.watches[0].sound == sound)
-        was_ringing = active_sound and self.alarm_active
-        if active_sound:
+        was_ringing = False
+        if self.current_alert is not None and self.current_alert.watches[0].sound == sound:
+            was_ringing = self.alarm_active
             self.stop_sound()
             self.current_alert = Found(self.current_alert.article, tuple(
                 replace(watch, sound="") if watch.sound == sound else watch
@@ -817,13 +821,15 @@ class WatcherApp:
         except OSError as exc:
             self.log(f"Couldn't remove sound: {exc}")
             return
+        finally:
+            # Switching the active alert to Chime must survive a failed file deletion.
+            if was_ringing:
+                self.play("")
+                self.sound_mode = "alert"
         try:
             path.parent.rmdir()
         except OSError:
             pass
-        if was_ringing:
-            self.play("")
-            self.sound_mode = "alert"
         self.refresh_sounds()
         message = (f"{count} exam{'s' if count != 1 else ''} now use Chime." if count else
                    f"Removed {path.name}.")
@@ -890,7 +896,7 @@ class WatcherApp:
         self.match = None
         self.alert_actions.pack_forget()
         self.show_monitor_layout()
-        if self.pending_alerts:
+        if self.pending_alerts and not self.paused.is_set():
             self.next_alert()
         else:
             self.update_status()
@@ -947,7 +953,10 @@ class WatcherApp:
             tag = f"url_{self.log_link_count}"
             self.log_box.insert("end", f"    {url}\n", tag)
             self.log_box.tag_configure(tag, foreground=self.colors["accent"], underline=True)
-            self.log_box.tag_bind(tag, "<Button-1>", lambda event, link=url: self.open_url(link))
+            def open_link(event: tk.Event, link: str = url):
+                self.open_url(link)
+
+            self.log_box.tag_bind(tag, "<Button-1>", open_link)
             self.log_box.tag_bind(tag, "<Enter>", lambda event: self.log_box.configure(cursor="hand2"))
             self.log_box.tag_bind(tag, "<Leave>", lambda event: self.log_box.configure(cursor="xterm"))
         if int(self.log_box.index("end-1c").split(".")[0]) > 300:
@@ -1005,9 +1014,13 @@ class WatcherApp:
             if selected:
                 card.create_text(173, 16, text="⋯", fill=self.colors["muted"],
                                  font=("Segoe UI", 10), anchor="center")
-            card.bind("<Button-1>", lambda event, row=index, item=card:
-                      self.show_watch_menu(row, item) if row == self.selection_index and event.x > 155
-                      else self.select_watch(row))
+            def select_card(event: tk.Event, row: int = index, item: tk.Canvas = card):
+                if row == self.selection_index and event.x > 155:
+                    self.show_watch_menu(row, item)
+                else:
+                    self.select_watch(row)
+
+            card.bind("<Button-1>", select_card)
             card.bind("<MouseWheel>", lambda event: self.watch_list.yview_scroll(
                 -1 if event.delta > 0 else 1, "units"))
         limit = 140 if self.form_frame.winfo_manager() else 270
@@ -1027,7 +1040,7 @@ class WatcherApp:
         self.sync_sound_choice()
         self.result_button.configure(state="normal" if self.current_alert and not self.preview else "disabled")
         count = len(self.pending_alerts)
-        self.next_button.configure(state="normal" if count else "disabled",
+        self.next_button.configure(state="normal" if count and not self.paused.is_set() else "disabled",
                                    text=f"Next alert ({count})" if count else "Next alert")
         if count and not self.next_button.winfo_manager():
             self.next_button.pack(side="left", padx=4)
@@ -1140,6 +1153,7 @@ class WatcherApp:
         self.paused.set()
         self.start_button.configure(text="▶  Resume", command=self.resume_watching)
         self.log("Monitoring paused.")
+        self.update_controls()
         self.update_status()
 
     def resume_watching(self):
@@ -1148,6 +1162,9 @@ class WatcherApp:
         self.paused.clear()
         self.start_button.configure(text="Ⅱ  Pause", command=self.pause_watching)
         self.log("Monitoring resumed.")
+        if self.current_alert is None:
+            self.next_alert()
+        self.update_controls()
         self.update_status()
 
     def update_status(self):
@@ -1284,8 +1301,10 @@ class WatcherApp:
             self.next_alert()
 
     def next_alert(self):
-        if not self.pending_alerts:
+        if self.paused.is_set() or not self.pending_alerts:
             return
+        if self.preview:
+            self.stop_preview()
         self.current_alert = self.pending_alerts.popleft()
         self.alert_started = time.monotonic()
         self.match = self.current_alert.article

@@ -2,6 +2,8 @@ __pycache__/
 *.py[cod]
 .venv/
 .venv-build/
+.ruff_cache/
+.mypy_cache/
 build/
 dist/
 *.spec

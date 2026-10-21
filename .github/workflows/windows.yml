@@ -1,0 +1,59 @@
+name: Windows checks and build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install development checks
+        run: python -m pip install -r requirements-dev.txt
+      - name: Lint
+        run: python -m ruff check .
+      - name: Check types
+        run: python -m mypy
+      - name: Run offline regression tests
+        run: python -m unittest -q
+
+  build:
+    needs: checks
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Create build environment
+        run: python -m venv .venv-build
+      - name: Test and build executable
+        shell: cmd
+        run: build_exe.cmd
+      - name: Write SHA256 checksum
+        shell: pwsh
+        run: |
+          $checksum = (Get-FileHash -Algorithm SHA256 -LiteralPath dist/PRCResultAlarm.exe).Hash.ToLowerInvariant()
+          "$checksum  PRCResultAlarm.exe" | Set-Content -LiteralPath dist/SHA256SUMS.txt -Encoding ascii
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: PRCResultAlarm-windows
+          path: |
+            dist/PRCResultAlarm.exe
+            dist/SHA256SUMS.txt
+          if-no-files-found: error

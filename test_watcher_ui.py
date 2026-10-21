@@ -58,6 +58,59 @@ class WatcherUITests(unittest.TestCase):
         self.assertEqual(self.app.status.get(), "Reconnecting")
         self.assertEqual(self.app.source_state, ["error", "error"])
 
+    def test_result_already_in_queue_waits_for_resume_before_ringing(self):
+        self.app.running = True
+        self.app.pause_watching()
+        self.app.play = Mock()
+        found = Found(Article("Result found", "https://prc.gov.ph/node/1"), (Watch(),))
+        self.app.events.put(("found", 0, found))
+        with patch.object(self.root, "deiconify"), patch.object(self.root, "lift"), \
+                patch.object(self.root, "attributes"):
+            self.app.pump()
+            self.app.play.assert_not_called()
+            self.assertIsNone(self.app.current_alert)
+            self.assertEqual(len(self.app.pending_alerts), 1)
+            self.app.resume_watching()
+        self.app.play.assert_called_once()
+        self.assertEqual(self.app.match, found.article)
+        self.assertEqual(len(self.app.pending_alerts), 0)
+
+    def test_dismissing_alert_while_paused_keeps_next_alert_queued(self):
+        self.app.running = True
+        self.app.started_once = True
+        self.app.play = Mock()
+        one = Found(Article("First result", "https://prc.gov.ph/node/1"), (Watch(),))
+        two = Found(Article("Second result", "https://prc.gov.ph/node/2"), (Watch(),))
+        with patch.object(self.root, "deiconify"), patch.object(self.root, "lift"), \
+                patch.object(self.root, "attributes"):
+            self.app.show_match(one)
+            self.app.show_match(two)
+            self.app.pause_watching()
+            self.app.dismiss_alert()
+            self.assertEqual(self.app.status.get(), "Paused")
+            self.assertIsNone(self.app.current_alert)
+            self.assertEqual(self.app.play.call_count, 1)
+            self.assertEqual(len(self.app.pending_alerts), 1)
+            self.app.resume_watching()
+        self.assertEqual(self.app.match, two.article)
+        self.assertEqual(self.app.play.call_count, 2)
+
+    def test_resuming_queued_result_ends_any_alert_preview(self):
+        self.app.running = True
+        self.app.play = Mock()
+        self.app.pause_watching()
+        found = Found(Article("Result", "https://prc.gov.ph/node/1"), (Watch(),))
+        self.app.show_match(found)
+        self.app.preview_alert()
+        timer = self.app.preview_job
+        with patch.object(self.root, "deiconify"), patch.object(self.root, "lift"), \
+                patch.object(self.root, "attributes"):
+            self.app.resume_watching()
+        self.assertIsNone(self.app.preview)
+        self.assertNotIn(timer, self.root.tk.call("after", "info"))
+        self.assertEqual(self.app.match, found.article)
+        self.assertEqual(self.app.sound_mode, "alert")
+
     def test_found_result_survives_done_and_keeps_its_link(self):
         match = Article("October 2026 Pharmacists Licensure Examination Results", "https://prc.gov.ph/node/1")
         self.app.auto_open.set(False)
@@ -328,6 +381,44 @@ class WatcherUITests(unittest.TestCase):
         self.assertEqual(self.app.status.get(), "Results released")
         self.assertEqual(len(self.app.results), 1)
         self.assertEqual(self.app.play.call_count, 2)
+
+    def prepare_custom_sound_alert(self):
+        source = Path(self.preferences.name) / "active.wav"
+        prc_result_alarm.create_alarm(source)
+        imported = prc_result_alarm.import_sound(source, self.app.settings_path.parent)
+        self.app.refresh_sounds()
+        self.app.store_watches([Watch(Target(), imported)])
+        self.app.sound_tree.selection_set("0")
+        with patch.object(self.root, "deiconify"), patch.object(self.root, "lift"), \
+                patch.object(self.root, "attributes"):
+            self.app.show_match(Found(Article("Result", "https://prc.gov.ph/node/1"),
+                                     tuple(self.app.watches)))
+        return self.app.settings_path.parent / imported
+
+    def test_failed_sound_deletion_restores_ringing_with_default(self):
+        path = self.prepare_custom_sound_alert()
+        self.assertTrue(self.app.alarm_active)
+        with patch.object(Path, "unlink", side_effect=PermissionError("File is locked")), \
+                patch.object(self.app, "play", wraps=self.app.play) as play:
+            self.app.remove_sound()
+        play.assert_called_once_with("")
+        self.assertTrue(self.app.alarm_active)
+        self.assertEqual(self.app.sound_mode, "alert")
+        self.assertEqual(self.app.current_alert.watches[0].sound, "")
+        self.assertEqual(prc_result_alarm.load_watches(self.app.settings_path)[0].sound, "")
+        self.assertTrue(path.exists())
+        self.assertIn("Couldn't remove sound", self.app.log_box.get("1.0", "end"))
+
+    def test_failed_sound_deletion_keeps_a_silenced_alert_silent(self):
+        path = self.prepare_custom_sound_alert()
+        self.app.silence()
+        with patch.object(Path, "unlink", side_effect=PermissionError("File is locked")), \
+                patch.object(self.app, "play", wraps=self.app.play) as play:
+            self.app.remove_sound()
+        play.assert_not_called()
+        self.assertFalse(self.app.alarm_active)
+        self.assertIsNotNone(self.app.current_alert)
+        self.assertTrue(path.exists())
 
     def test_preferences_survive_restart(self):
         self.app.auto_open.set(True)

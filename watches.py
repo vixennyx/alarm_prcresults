@@ -145,7 +145,7 @@ def load_watches(path: Path) -> list[Watch]:
         rows = data.get("watches")
         if not isinstance(rows, list) or len(rows) > 100:
             raise ValueError("Watch list must contain at most 100 entries.")
-        watches = []
+        watches: list[Watch] = []
         for row in rows:
             target = Target(**row["target"])
             if not all(isinstance(value, str) for value in asdict(target).values()):
